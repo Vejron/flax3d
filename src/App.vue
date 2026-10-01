@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Camera, CameraOff, Crosshair, MoveUp, RotateCcw, SlidersHorizontal, Wind, X } from 'lucide-vue-next'
 import type { Pose, PoseDetector } from '@tensorflow-models/pose-detection'
-import { advanceCourse, courseRings, type CourseProgress } from './course'
+import { advanceCourse, courseRings, courseSpawn, type CourseProgress } from './course'
 import { flightConfig, initialFlightState, stepFlight, type FlightConfig, type FlightControls } from './flight'
 import { PoseControls } from './poseControls'
 import { createScene, terrainHeight } from './scene'
@@ -10,7 +10,7 @@ import { createScene, terrainHeight } from './scene'
 const viewport = ref<HTMLElement | null>(null)
 const video = ref<HTMLVideoElement | null>(null)
 const skeleton = ref<HTMLCanvasElement | null>(null)
-const flight = ref(initialFlightState(terrainHeight(0, 0)))
+const flight = ref({ ...initialFlightState(terrainHeight(courseSpawn.x, courseSpawn.z)), ...courseSpawn })
 const course = ref<CourseProgress>({ nextRing: 0, laps: 0 })
 const cameraStatus = ref<'off' | 'loading' | 'tracking' | 'lost'>('off')
 const error = ref('')
@@ -270,7 +270,7 @@ onBeforeUnmount(() => {
       <div class="metric"><span>01 / AIRSPEED</span><strong>{{ Math.round(flight.speed * 3.6) }}<small>
             km/h</small></strong></div>
       <div class="metric"><span>02 / HEADING</span><strong>{{ ((flight.yaw * 180 / Math.PI + 360) % 360).toFixed(0)
-      }}<small>°</small></strong></div>
+          }}<small>°</small></strong></div>
       <div class="metric course-metric"><span>03 / COURSE</span><strong>{{ courseRings[course.nextRing]?.kind ===
         'checkpoint' ?
         `${course.nextRing} / ${courseRings.length - 2}` : courseRings[course.nextRing]?.kind?.toUpperCase() }}<small>
@@ -317,7 +317,7 @@ onBeforeUnmount(() => {
       <section class="instruction-panel" aria-label="Flight controls">
         <div class="instruction-heading">
           <Wind :size="18" /> <span>{{ cameraStatus === 'tracking' ? 'FLY WITH YOUR BODY' : 'FLY WITH YOUR KEYBOARD'
-          }}</span>
+            }}</span>
         </div>
         <div class="instructions" v-if="cameraStatus === 'tracking'">
           <div><span>01</span> Raise & lower both arms <strong>FLAP</strong></div>

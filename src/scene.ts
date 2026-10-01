@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { courseRings } from './course'
+import { courseRings, courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
 import { terrainHeight } from './terrain'
 
@@ -173,9 +173,13 @@ export function createScene(container: HTMLElement) {
     const trailView = new THREE.Vector3()
     const trailSide = new THREE.Vector3()
 
-    const cameraTarget = new THREE.Vector3(0, 7, 13)
+    const cameraTarget = new THREE.Vector3(
+        courseSpawn.x - Math.sin(courseSpawn.yaw) * 12,
+        terrainHeight(courseSpawn.x, courseSpawn.z) + 7,
+        courseSpawn.z + Math.cos(courseSpawn.yaw) * 12,
+    )
     camera.position.copy(cameraTarget)
-    let cameraYaw = 0
+    let cameraYaw = courseSpawn.yaw
     let lastCameraTime = 0
     function resize() {
         const width = container.clientWidth

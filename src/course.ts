@@ -3,10 +3,10 @@ import { terrainHeight } from './terrain'
 
 export const courseRings = [
     { x: 0, z: -20, kind: 'start' },
-    { x: 26, z: -40, kind: 'checkpoint' },
-    { x: 20, z: -78, kind: 'checkpoint' },
-    { x: -18, z: -82, kind: 'checkpoint' },
-    { x: -28, z: -48, kind: 'checkpoint' },
+    { x: 52, z: -40, kind: 'checkpoint' },
+    { x: 40, z: -78, kind: 'checkpoint' },
+    { x: -36, z: -82, kind: 'checkpoint' },
+    { x: -56, z: -48, kind: 'checkpoint' },
     { x: -12, z: -20, kind: 'finish' },
 ].map((ring, index, rings) => {
     const previous = rings[(index + rings.length - 1) % rings.length]!
@@ -20,6 +20,13 @@ export const courseRings = [
         forwardZ: (next.z - previous.z) / length,
     }
 })
+
+const startRing = courseRings[0]!
+export const courseSpawn = {
+    x: startRing.x - startRing.forwardX * 20,
+    z: startRing.z - startRing.forwardZ * 20,
+    yaw: Math.atan2(startRing.forwardX, -startRing.forwardZ),
+}
 
 export interface CourseProgress {
     nextRing: number

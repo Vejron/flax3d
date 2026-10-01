@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import type { Pose } from '@tensorflow-models/pose-detection'
 import App from '../App.vue'
-import { advanceCourse, courseRings } from '../course'
+import { advanceCourse, courseRings, courseSpawn } from '../course'
 import { flightConfig, initialFlightState, stepFlight } from '../flight'
 import { PoseControls } from '../poseControls'
 import { terrainHeight as rollingTerrainHeight } from '../terrain'
@@ -283,8 +283,12 @@ describe('course', () => {
     expect(progress).toEqual({ nextRing: 0, laps: 1 })
     const finish = courseRings[courseRings.length - 1]!
     const start = courseRings[0]!
+    const width = Math.max(...courseRings.map((ring) => ring.x)) - Math.min(...courseRings.map((ring) => ring.x))
+    expect(width).toBeGreaterThanOrEqual(108)
     expect(Math.hypot(start.x - finish.x, start.z - finish.z)).toBeLessThan(20)
     expect((start.x - finish.x) * finish.forwardX + (start.z - finish.z) * finish.forwardZ).toBeGreaterThan(0)
+    expect((courseSpawn.x - start.x) * start.forwardX + (courseSpawn.z - start.z) * start.forwardZ).toBeCloseTo(-20)
+    expect(Math.sin(courseSpawn.yaw) * start.forwardX - Math.cos(courseSpawn.yaw) * start.forwardZ).toBeCloseTo(1)
     const [nextStart, nextEnd] = crossing(0)
     expect(advanceCourse(progress, nextStart, nextEnd)).toEqual({ nextRing: 1, laps: 1 })
   })
