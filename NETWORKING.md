@@ -80,13 +80,13 @@ exactly.
 | `bank` | milliradians | ×1000 | `i16` | `±1000` |
 | `speed` | centimetres/second | ×100 | `u16` | `≤10000` |
 | `spread` | milli-units | ×1000 | `u16` | `0..=1000` |
-| `flap`, `flying` | boolean | — | bool | — |
+| `flap`, `flying`, `fire` | boolean | — | bool | — |
 | `wingLeft`, `wingRight` | milliradians | ×1000 | `i16` | `±2000` |
 
 ### Client → server: `Update`
 
 ```text
-[ 3, sequence, [ x, y, z, yaw, bank, speed, flying, spread, flap, wingLeft, wingRight ] ]
+[ 4, sequence, [ x, y, z, yaw, bank, speed, flying, spread, flap, wingLeft, wingRight, fire ] ]
 ```
 
 - `sequence` is a per-connection counter incremented on every send.
@@ -95,6 +95,13 @@ exactly.
 - `wingLeft` / `wingRight` are the per-side shoulder angles taken from the same values the local
   avatar renders with (pose-driven when the camera is tracking, otherwise the flap beat). Sending
   both lets remote players see asymmetric flapping as well as spread.
+- `fire` is true while the sender holds the trigger. It is **not** bullet state: peers only use it to
+  play a cosmetic shot from their own copy of the sender's gun, so bullets, drop and impacts stay
+  local and nothing extra is simulated on the server. A tap lasts a single frame but updates are
+  unreliable and only sent at 20 Hz, so the client repeats the flag over the next three updates
+  (~100 ms, just under the 110 ms fire interval) — enough to survive a lost datagram while still
+  producing exactly one shot. Holding the trigger keeps it true and each client throttles its own
+  shots with the fire interval.
 - Sent via `encodeUpdate` at most once every 50 ms (20 Hz).
 
 ### Server → client: `Event`
@@ -103,7 +110,7 @@ Tagged by a leading integer:
 
 ```text
 welcome: [ 0, id ]
-state:   [ 1, id, sequence, [ ...same 11 position values... ] ]
+state:   [ 1, id, sequence, [ ...same 12 position values... ] ]
 leave:   [ 2, id ]
 ```
 
@@ -125,9 +132,9 @@ reliable streams instead. Well-known ports: QUIC runs on UDP 443 in production.
 
 Server-side (`Position::valid`, `MAX_PACKET`):
 
-- Rejects packets larger than `MAX_PACKET` (512 bytes). A real update encodes to about 33 bytes.
+- Rejects packets larger than `MAX_PACKET` (512 bytes). A real update encodes to about 34 bytes.
 - Rejects datagrams that fail to deserialize as `Update`.
-- Requires `v == 3` (see the migration note below).
+- Requires `v == 4` (see the migration note below).
 - Requires every fixed-point field to be within the range in the units table.
 - Rate limits accepted input to at most one update per 25 ms per connection.
 - Rejects non-monotonic `sequence` values per player.
@@ -136,16 +143,17 @@ Client-side (`handleEvent`, `decodePosition`, `receiveReliable`):
 
 - Ignores unparsable MessagePack, non-array messages, and arrays of the wrong length.
 - Ignores events whose `id` is not a safe integer, and its own `id`.
-- Ignores a position array that is not exactly 11 entries or holds a non-numeric value.
+- Ignores a position array that is not exactly 12 entries or holds a non-numeric value.
 - Ignores reliable stream frames larger than 512 bytes.
 - Drops stale/duplicate `sequence` values.
 
 ## Migration note
 
-Version 3 replaced the earlier JSON encoding outright; there is no dual-dialect path. Deploy the
-server and the frontend together, then **hard-refresh any tab that is already open**. A stale bundle
-keeps sending JSON, which the server silently ignores, so the tab falls back to `SOLO` and retries
-until it is reloaded.
+Version 3 replaced the earlier JSON encoding outright; there is no dual-dialect path. Version 4
+appended the `fire` flag to the position array, so a v3 client encodes 11 fields while a v4 server
+expects 12. Version mismatches and short arrays are dropped by validation, which makes an out-of-date
+tab fall back to `SOLO` and retry. Deploy the server and the frontend together, then **hard-refresh
+every tab that is already open**.
 
 ## Tests
 
@@ -165,6 +173,8 @@ Remote players are rendered smoothly rather than snapping to each received frame
 - Each player keeps the previous and current snapshot plus a receive timestamp.
 - `remotes(now)` interpolates position, `bank`, `wingLeft`, and `wingRight` between the two
   snapshots, and yaw along the shortest arc.
+- `fire` is a level flag rather than an interpolated value: `remotes(now)` passes through the newest
+  snapshot's value and the renderer holds it until the next packet replaces it.
 - The interpolation window is the measured arrival gap between the last two packets, clamped to
   40–300 ms (100 ms until a second packet arrives). This keeps motion continuous at any send rate
   without hard-coding one.
@@ -176,7 +186,7 @@ Remote players are rendered smoothly rather than snapping to each received frame
 
 Positions are sent at 20 Hz and interpolated, which is a good balance for a game of this speed:
 
-- A full `Update` is about 33 bytes, plus roughly 50 bytes of IPv6/UDP/QUIC framing per datagram.
+- A full `Update` is about 34 bytes, plus roughly 50 bytes of IPv6/UDP/QUIC framing per datagram.
   At 20 Hz that is under 2 KB/s per client — comfortably inside typical MTU, so a datagram is never
   fragmented and a lost one costs very little.
 - Server egress scales as `players × (players − 1) × rate × size`. At the 32-player cap and 20 Hz
@@ -213,7 +223,7 @@ Bumping the rate means keeping three numbers in sync: `SEND_INTERVAL_MS` in `src
 | --- | --- |
 | Client transport, wire codec, interpolation | `src/network.ts` |
 | Client usage in frame loop and reconnect timer | `src/App.vue` |
-| Remote avatar and wing rendering | `src/scene.ts` |
+| Remote avatar, wing and shot rendering | `src/scene.ts` |
 | Wire-format fixture (client side) | `src/__tests__/network.spec.ts` |
 | Wire-format fixture (server side) | `server/src/main.rs` |
 | Dev certificate-hash proxy | `vite.config.ts` |

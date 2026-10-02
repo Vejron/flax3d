@@ -1,0 +1,494 @@
+import * as THREE from 'three'
+
+/**
+ * Plain 3D vector used by the projectile simulation. Kept free of THREE types so
+ * the ballistics can be unit tested without a WebGL context.
+ */
+export interface Vec3 {
+    x: number
+    y: number
+    z: number
+}
+
+export interface Bullet {
+    position: Vec3
+    velocity: Vec3
+    age: number
+}
+
+export const weaponConfig = {
+    /** Muzzle speed in metres per second. */
+    speed: 110,
+    /** Downward acceleration applied to every bullet, in m/s². This is what produces the drop. */
+    gravity: 11,
+    /** Seconds a bullet stays alive before it is recycled. */
+    life: 4,
+    /** Aim scatter half-angle in radians. */
+    spread: 0.006,
+    /** Seconds between shots while the trigger is held. */
+    fireInterval: 0.11,
+    /** Hard cap on live bullets; the pool never grows past this. */
+    maxBullets: 160,
+    /** Longest distance between collision samples, in metres. */
+    substep: 0.5,
+    /** Safety cap on samples per frame so a stalled tab cannot hang the loop. */
+    maxSubsteps: 24,
+    /** Bullets below this altitude are recycled without an impact effect. */
+    killAltitude: -60,
+    /** Length of the tracer streak drawn behind each bullet, in metres. */
+    tracerLength: 3.2,
+    /** Pooled impact rings. */
+    maxImpacts: 24,
+    /** Lifetime of an impact ring, in seconds. */
+    impactLife: 0.45,
+    /** Pooled sparks shared by every impact. */
+    maxSparks: 320,
+    /** Sparks emitted per impact. */
+    sparksPerImpact: 14,
+}
+
+export type WeaponConfig = typeof weaponConfig
+
+export interface BulletImpact {
+    position: Vec3
+    normal: Vec3
+    velocity: Vec3
+    speed: number
+}
+
+export interface BulletStep {
+    bullet: Bullet
+    impact: BulletImpact | null
+    dead: boolean
+}
+
+/** Builds a bullet travelling at the configured muzzle speed along `direction`. */
+export function createBullet(origin: Vec3, direction: Vec3, config: WeaponConfig = weaponConfig): Bullet {
+    const length = Math.hypot(direction.x, direction.y, direction.z) || 1
+    return {
+        position: { ...origin },
+        velocity: {
+            x: (direction.x / length) * config.speed,
+            y: (direction.y / length) * config.speed,
+            z: (direction.z / length) * config.speed,
+        },
+        age: 0,
+    }
+}
+
+/**
+ * Offsets a direction within a cone of `spread` radians. The offset is always
+ * tangential to the aim, so the shot never gets shorter, only wider.
+ */
+export function scatter(direction: Vec3, spread: number, random: () => number = Math.random): Vec3 {
+    const length = Math.hypot(direction.x, direction.y, direction.z) || 1
+    const x = direction.x / length
+    const y = direction.y / length
+    const z = direction.z / length
+    let ox = random() - 0.5
+    let oy = random() - 0.5
+    let oz = random() - 0.5
+    const along = ox * x + oy * y + oz * z
+    ox -= along * x
+    oy -= along * y
+    oz -= along * z
+    const tangent = Math.hypot(ox, oy, oz) || 1
+    const angle = spread * random()
+    return { x: x + (ox / tangent) * angle, y: y + (oy / tangent) * angle, z: z + (oz / tangent) * angle }
+}
+
+/** Terrain surface normal from finite differences of the height field. */
+export function terrainNormal(x: number, z: number, terrainHeight: (x: number, z: number) => number): Vec3 {
+    const delta = 0.6
+    const dx = (terrainHeight(x + delta, z) - terrainHeight(x - delta, z)) / (2 * delta)
+    const dz = (terrainHeight(x, z + delta) - terrainHeight(x, z - delta)) / (2 * delta)
+    const length = Math.hypot(dx, 1, dz) || 1
+    return { x: -dx / length, y: 1 / length, z: -dz / length }
+}
+
+/**
+ * Advances one bullet with gravity and walks the travelled segment in small
+ * samples so a fast round cannot tunnel through a hill. Returns the new state,
+ * any terrain impact, and whether the bullet should be recycled.
+ */
+export function stepBullet(
+    bullet: Bullet,
+    seconds: number,
+    terrainHeight: (x: number, z: number) => number,
+    config: WeaponConfig = weaponConfig,
+): BulletStep {
+    const age = bullet.age + Math.max(0, seconds)
+    const velocity = { ...bullet.velocity }
+    velocity.y -= config.gravity * Math.max(0, seconds)
+    const travelled = Math.hypot(velocity.x, velocity.y, velocity.z) * Math.max(0, seconds)
+    const steps = Math.max(1, Math.min(config.maxSubsteps, Math.ceil(travelled / config.substep)))
+    const step = Math.max(0, seconds) / steps
+    const position = { ...bullet.position }
+    let impact: BulletImpact | null = null
+
+    for (let index = 0; index < steps; index++) {
+        const next = {
+            x: position.x + velocity.x * step,
+            y: position.y + velocity.y * step,
+            z: position.z + velocity.z * step,
+        }
+        const ground = terrainHeight(next.x, next.z)
+        if (next.y <= ground) {
+            // Interpolate the crossing so the impact sits on the surface, not below it.
+            const above = position.y - terrainHeight(position.x, position.z)
+            const below = next.y - ground
+            const fraction = above - below > 1e-6 ? Math.min(1, Math.max(0, above / (above - below))) : 1
+            const hit = {
+                x: position.x + (next.x - position.x) * fraction,
+                y: position.y + (next.y - position.y) * fraction,
+                z: position.z + (next.z - position.z) * fraction,
+            }
+            impact = {
+                position: hit,
+                normal: terrainNormal(hit.x, hit.z, terrainHeight),
+                velocity: { ...velocity },
+                speed: Math.hypot(velocity.x, velocity.y, velocity.z),
+            }
+            position.x = hit.x
+            position.y = hit.y
+            position.z = hit.z
+            break
+        }
+        position.x = next.x
+        position.y = next.y
+        position.z = next.z
+    }
+
+    return {
+        bullet: { position, velocity, age },
+        impact,
+        dead: impact !== null || age >= config.life || position.y < config.killAltitude,
+    }
+}
+
+export interface Gun {
+    muzzle: THREE.Object3D
+    dispose: () => void
+}
+
+/**
+ * Adds a forward-facing cannon on the flyer's back and returns its muzzle
+ * marker, which the weapon rig uses as the spawn point for rounds. It sits
+ * above the body silhouette so the chase camera never occludes it.
+ */
+export function createGun(flyer: THREE.Object3D): Gun {
+    const metal = new THREE.MeshStandardMaterial({ color: '#39434a', roughness: 0.45, metalness: 0.55 })
+    const trim = new THREE.MeshStandardMaterial({ color: '#c96b3f', roughness: 0.6, metalness: 0.25 })
+    const group = new THREE.Group()
+    group.name = 'gun'
+
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.095, 1.6, 10), metal)
+    barrel.rotation.x = Math.PI / 2
+    barrel.position.set(0, 0, -0.5)
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.26, 0.44), trim)
+    housing.position.set(0, -0.05, 0.24)
+    const pylon = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.75, 0.2), metal)
+    pylon.position.set(0, -0.42, 0.3)
+    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.1, 0.26), metal)
+    sight.position.set(0, 0.18, -0.15)
+
+    const muzzle = new THREE.Object3D()
+    muzzle.name = 'muzzle'
+    muzzle.position.set(0, 0, -1.36)
+
+    group.add(barrel, housing, pylon, sight, muzzle)
+    group.position.set(0, 1, -0.3)
+    flyer.add(group)
+
+    return {
+        muzzle,
+        dispose() {
+            flyer.remove(group)
+            barrel.geometry.dispose()
+            housing.geometry.dispose()
+            pylon.geometry.dispose()
+            sight.geometry.dispose()
+            metal.dispose()
+            trim.dispose()
+        },
+    }
+}
+
+interface ImpactVisual {
+    position: THREE.Vector3
+    normal: THREE.Vector3
+    age: number
+    life: number
+    scale: number
+}
+
+interface Spark {
+    position: THREE.Vector3
+    velocity: THREE.Vector3
+    age: number
+    life: number
+    heat: number
+}
+
+export interface WeaponRig {
+    /**
+     * Fires one round if that shooter's trigger has cooled down. `origin` defaults to the local
+     * muzzle, so remote callers pass their own muzzle position and network id.
+     */
+    fire: (direction: THREE.Vector3, origin?: THREE.Vector3, shooter?: number) => boolean
+    /** Integrates bullets, refreshes tracers, and ages the impact effects. */
+    update: (seconds: number, terrainHeight: (x: number, z: number) => number) => void
+    /** Releases every GPU resource the rig owns. */
+    dispose: () => void
+}
+
+/** Cooldown key for the player's own gun; remote peers use their network id. */
+const LOCAL_SHOOTER = 0
+
+/**
+ * Renders and simulates the gun. Everything is pooled: bullets are a single
+ * instanced tracer mesh, impact rings are an instanced mesh, and sparks live in
+ * one Points buffer. Nothing is allocated per shot, and `dispose` frees it all.
+ */
+export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): WeaponRig {
+    const config = weaponConfig
+    const bullets: Bullet[] = []
+    const impacts: ImpactVisual[] = []
+    const sparks: Spark[] = []
+    /** Cooldown per shooter, so one player's burst never silences another's gun. */
+    const cooldowns = new Map<number, number>()
+    let flash = 0
+
+    const bulletGeometry = new THREE.CylinderGeometry(0.02, 0.07, 1, 6, 1, true)
+    const bulletMaterial = new THREE.MeshBasicMaterial({
+        color: '#ffe9a8',
+        toneMapped: false,
+        transparent: true,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+    })
+    const bulletMesh = new THREE.InstancedMesh(bulletGeometry, bulletMaterial, config.maxBullets)
+    bulletMesh.frustumCulled = false
+    bulletMesh.count = 0
+    bulletMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    scene.add(bulletMesh)
+
+    const flashGeometry = new THREE.SphereGeometry(0.2, 8, 6)
+    const flashMaterial = new THREE.MeshBasicMaterial({
+        color: '#ffd27a',
+        toneMapped: false,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+    })
+    const flashMesh = new THREE.Mesh(flashGeometry, flashMaterial)
+    flashMesh.visible = false
+    muzzle.add(flashMesh)
+
+    const ringGeometry = new THREE.RingGeometry(0.32, 0.46, 18)
+    ringGeometry.rotateX(-Math.PI / 2)
+    const ringMaterial = new THREE.MeshBasicMaterial({
+        color: '#ffffff',
+        toneMapped: false,
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+    })
+    const ringMesh = new THREE.InstancedMesh(ringGeometry, ringMaterial, config.maxImpacts)
+    ringMesh.frustumCulled = false
+    ringMesh.count = 0
+    ringMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    scene.add(ringMesh)
+
+    const sparkPositions = new Float32Array(config.maxSparks * 3)
+    const sparkColors = new Float32Array(config.maxSparks * 3)
+    const sparkPositionAttribute = new THREE.BufferAttribute(sparkPositions, 3).setUsage(THREE.DynamicDrawUsage)
+    const sparkColorAttribute = new THREE.BufferAttribute(sparkColors, 3).setUsage(THREE.DynamicDrawUsage)
+    const sparkGeometry = new THREE.BufferGeometry()
+    sparkGeometry.setAttribute('position', sparkPositionAttribute)
+    sparkGeometry.setAttribute('color', sparkColorAttribute)
+    const sparkMaterial = new THREE.PointsMaterial({
+        size: 0.3,
+        vertexColors: true,
+        toneMapped: false,
+        transparent: true,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        sizeAttenuation: true,
+    })
+    const sparkPoints = new THREE.Points(sparkGeometry, sparkMaterial)
+    sparkPoints.frustumCulled = false
+    sparkPoints.renderOrder = 2
+    for (let index = 0; index < config.maxSparks; index++) sparkPositions[index * 3 + 1] = -9999
+    scene.add(sparkPoints)
+
+    const up = new THREE.Vector3(0, 1, 0)
+    const aim = new THREE.Vector3()
+    const position = new THREE.Vector3()
+    const quaternion = new THREE.Quaternion()
+    const scale = new THREE.Vector3()
+    const matrix = new THREE.Matrix4()
+    const color = new THREE.Color()
+    const spread = new THREE.Vector3()
+
+    function spawnImpact(hit: BulletImpact) {
+        if (impacts.length >= config.maxImpacts) impacts.shift()
+        impacts.push({
+            position: new THREE.Vector3(hit.position.x, hit.position.y, hit.position.z),
+            normal: new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z),
+            age: 0,
+            life: config.impactLife,
+            scale: THREE.MathUtils.clamp(hit.speed / config.speed, 0.6, 1.6),
+        })
+
+        const burst = THREE.MathUtils.clamp(hit.speed / config.speed, 0.4, 1.4)
+        for (let index = 0; index < config.sparksPerImpact; index++) {
+            if (sparks.length >= config.maxSparks) sparks.shift()
+            // Spray a cone of debris around the surface normal.
+            spread
+                .set(
+                    hit.normal.x + (Math.random() - 0.5) * 1.15,
+                    hit.normal.y + (Math.random() - 0.5) * 1.15 + 0.35,
+                    hit.normal.z + (Math.random() - 0.5) * 1.15,
+                )
+                .normalize()
+            const launch = (2.2 + Math.random() * 4.6) * burst
+            sparks.push({
+                position: new THREE.Vector3(hit.position.x, hit.position.y, hit.position.z),
+                velocity: new THREE.Vector3(spread.x * launch, spread.y * launch, spread.z * launch),
+                age: 0,
+                life: 0.24 + Math.random() * 0.4,
+                heat: Math.random(),
+            })
+        }
+    }
+
+    function fire(direction: THREE.Vector3, origin?: THREE.Vector3, shooter = LOCAL_SHOOTER) {
+        if ((cooldowns.get(shooter) ?? 0) > 0) return false
+        cooldowns.set(shooter, config.fireInterval)
+        const from = origin ?? muzzle.getWorldPosition(position)
+        const target = scatter(direction, config.spread)
+        if (bullets.length >= config.maxBullets) bullets.shift()
+        bullets.push(createBullet({ x: from.x, y: from.y, z: from.z }, target, config))
+        // The flash mesh is parented to the local muzzle, so only light it for the local gun.
+        if (shooter === LOCAL_SHOOTER) {
+            flash = 1
+            flashMesh.visible = true
+        }
+        return true
+    }
+
+    function update(seconds: number, terrainHeight: (x: number, z: number) => number) {
+        cooldowns.forEach((remaining, shooter) => cooldowns.set(shooter, Math.max(0, remaining - seconds)))
+        if (flash > 0) {
+            flash = Math.max(0, flash - seconds * 18)
+            flashMaterial.opacity = 0.9 * flash
+            flashMesh.scale.set(1 + flash, 1 + flash, 1.8 + flash * 2.6)
+            if (flash === 0) flashMesh.visible = false
+        }
+
+        for (let index = bullets.length - 1; index >= 0; index--) {
+            const result = stepBullet(bullets[index]!, seconds, terrainHeight, config)
+            if (result.impact) spawnImpact(result.impact)
+            if (result.dead) bullets.splice(index, 1)
+            else bullets[index] = result.bullet
+        }
+
+        bulletMesh.count = bullets.length
+        for (let index = 0; index < bullets.length; index++) {
+            const bullet = bullets[index]!
+            aim.set(bullet.velocity.x, bullet.velocity.y, bullet.velocity.z).normalize()
+            quaternion.setFromUnitVectors(up, aim)
+            position
+                .set(bullet.position.x, bullet.position.y, bullet.position.z)
+                .addScaledVector(aim, -config.tracerLength * 0.5)
+            scale.set(1, config.tracerLength, 1)
+            matrix.compose(position, quaternion, scale)
+            bulletMesh.setMatrixAt(index, matrix)
+        }
+        bulletMesh.instanceMatrix.needsUpdate = true
+
+        for (let index = impacts.length - 1; index >= 0; index--) {
+            const impact = impacts[index]!
+            impact.age += seconds
+            if (impact.age >= impact.life) {
+                impacts.splice(index, 1)
+                continue
+            }
+            const progress = impact.age / impact.life
+            const grow = impact.scale * (0.35 + progress * 1.5)
+            quaternion.setFromUnitVectors(up, impact.normal)
+            position.copy(impact.position)
+            scale.set(grow, 1, grow)
+            matrix.compose(position, quaternion, scale)
+            ringMesh.setMatrixAt(index, matrix)
+            const fade = (1 - progress) ** 1.6
+            color.setRGB(fade, fade * 0.82, fade * 0.5)
+            ringMesh.setColorAt(index, color)
+        }
+        ringMesh.count = impacts.length
+        ringMesh.instanceMatrix.needsUpdate = true
+        if (ringMesh.instanceColor) ringMesh.instanceColor.needsUpdate = true
+
+        for (let index = sparks.length - 1; index >= 0; index--) {
+            const spark = sparks[index]!
+            spark.age += seconds
+            if (spark.age >= spark.life) {
+                sparks.splice(index, 1)
+                continue
+            }
+            spark.velocity.y -= config.gravity * seconds * 0.7
+            spark.position.addScaledVector(spark.velocity, seconds)
+        }
+        for (let index = 0; index < config.maxSparks; index++) {
+            const spark = sparks[index]
+            if (!spark) {
+                sparkPositions[index * 3] = 0
+                sparkPositions[index * 3 + 1] = -9999
+                sparkPositions[index * 3 + 2] = 0
+                sparkColors[index * 3] = 0
+                sparkColors[index * 3 + 1] = 0
+                sparkColors[index * 3 + 2] = 0
+                continue
+            }
+            sparkPositions[index * 3] = spark.position.x
+            sparkPositions[index * 3 + 1] = spark.position.y
+            sparkPositions[index * 3 + 2] = spark.position.z
+            const fade = (1 - spark.age / spark.life) ** 1.4
+            // White-hot at first, cooling to ember orange.
+            sparkColors[index * 3] = fade
+            sparkColors[index * 3 + 1] = fade * (0.55 + spark.heat * 0.35)
+            sparkColors[index * 3 + 2] = fade * (0.12 + spark.heat * 0.25)
+        }
+        sparkPositionAttribute.needsUpdate = true
+        sparkColorAttribute.needsUpdate = true
+    }
+
+    function dispose() {
+        muzzle.remove(flashMesh)
+        scene.remove(bulletMesh)
+        scene.remove(ringMesh)
+        scene.remove(sparkPoints)
+        bulletMesh.dispose()
+        ringMesh.dispose()
+        bulletGeometry.dispose()
+        bulletMaterial.dispose()
+        flashGeometry.dispose()
+        flashMaterial.dispose()
+        ringGeometry.dispose()
+        ringMaterial.dispose()
+        sparkGeometry.dispose()
+        sparkMaterial.dispose()
+        bullets.length = 0
+        impacts.length = 0
+        sparks.length = 0
+    }
+
+    return { fire, update, dispose }
+}

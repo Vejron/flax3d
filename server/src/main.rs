@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 const MAX_PLAYERS: usize = 32;
 const MAX_PACKET: usize = 512;
 /// Wire schema version, mirrored by `MESSAGE_VERSION` in `src/network.ts`.
-const MESSAGE_VERSION: u8 = 3;
+const MESSAGE_VERSION: u8 = 4;
 
 /// Fixed-point wire position. Units mirror `src/network.ts` and are documented in NETWORKING.md.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -44,6 +44,8 @@ struct Position {
     /// Shoulder angles in milliradians.
     wing_left: i16,
     wing_right: i16,
+    /// True while the sender is holding the trigger. Relayed so peers can play a cosmetic shot.
+    fire: bool,
 }
 
 impl Position {
@@ -74,6 +76,7 @@ impl Default for Position {
             flap: false,
             wing_left: 0,
             wing_right: 0,
+            fire: false,
         }
     }
 }
@@ -386,8 +389,8 @@ mod tests {
     #[test]
     fn decodes_a_client_update_fixture() {
         let fixture: &[u8] = &[
-            147, 3, 7, 155, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
-            5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82,
+            147, 4, 7, 156, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
+            5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 195,
         ];
         let Update(version, sequence, position) = rmp_serde::from_slice(fixture).unwrap();
         assert_eq!(version, MESSAGE_VERSION);
@@ -406,6 +409,7 @@ mod tests {
                 flap: false,
                 wing_left: -250,
                 wing_right: 850,
+                fire: true,
             }
         );
         assert!(position.valid());

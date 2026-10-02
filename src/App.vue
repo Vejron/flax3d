@@ -83,6 +83,8 @@ let detector: PoseDetector | null = null
 let latestPose: Pose | null = null
 let lastPoseAt = 0
 let flapQueued = false
+let fireQueued = false
+let pointerFiring = false
 let renderFrame = 0
 let poseFrame = 0
 let lastFrame = 0
@@ -121,6 +123,10 @@ function keyDown(event: KeyboardEvent) {
 function keyUp(event: KeyboardEvent) { keys.delete(event.code) }
 
 function flap() { flapQueued = true }
+
+function startFiring() { pointerFiring = true; fireQueued = true }
+
+function stopFiring() { pointerFiring = false }
 
 function resetTuning() { Object.assign(tuning, flightConfig) }
 
@@ -178,14 +184,16 @@ function frame(now: number) {
     ? { ...controls.value, flap: flapQueued, flapPower: now - lastPoseAt < 150 ? controls.value.flapPower : 0 }
     : { flap: flapQueued, steer: Number(keys.has('ArrowRight') || keys.has('KeyD')) - Number(keys.has('ArrowLeft') || keys.has('KeyA')), spread: keys.has('ArrowDown') || keys.has('KeyS') ? 0 : 1 }
   flapQueued = false
+  const firing = keys.has('KeyF') || fireQueued || pointerFiring
+  fireQueued = false
   const previousFlight = flight.value
   flight.value = stepFlight(previousFlight, input, dt, terrainHeight, tuning)
   course.value = advanceCourse(course.value, previousFlight, flight.value)
   liftOutput.value += ((input.flap ? 1 : Math.min(1, (input.flapPower ?? 0) / tuning.maxWingPower)) - liftOutput.value) * Math.min(1, dt * 12)
   const remotes = network?.remotes(now) ?? []
   nearbyPlayers.value = remotes.length
-  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes)
-  network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now)
+  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes, firing)
+  network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now, firing)
   renderFrame = requestAnimationFrame(frame)
 }
 
@@ -264,6 +272,8 @@ onMounted(() => {
   renderFrame = requestAnimationFrame(frame)
   window.addEventListener('keydown', keyDown)
   window.addEventListener('keyup', keyUp)
+  window.addEventListener('pointerup', stopFiring)
+  window.addEventListener('pointercancel', stopFiring)
   connectNetwork()
 })
 
@@ -276,12 +286,14 @@ onBeforeUnmount(() => {
   scene?.dispose()
   window.removeEventListener('keydown', keyDown)
   window.removeEventListener('keyup', keyUp)
+  window.removeEventListener('pointerup', stopFiring)
+  window.removeEventListener('pointercancel', stopFiring)
 })
 </script>
 
 <template>
   <main class="game">
-    <div ref="viewport" class="viewport" aria-label="3D flight scene" />
+    <div ref="viewport" class="viewport" aria-label="3D flight scene" @pointerdown="startFiring" />
     <div class="grain" aria-hidden="true" />
     <header class="topbar">
       <div class="brand"><span class="brand-mark">F<span>·</span></span><span>FLAX <small>FLIGHT LAB</small></span>
@@ -355,15 +367,23 @@ onBeforeUnmount(() => {
           <div><span>02</span> Hold wings level <strong>GLIDE</strong></div>
           <div><span>03</span> Tilt one wing <strong>STEER</strong></div>
           <div><span>04</span> Angle wings down <strong>DIVE</strong></div>
+          <div><span>05</span> Press <kbd>F</kbd> or click the sky <strong>FIRE</strong></div>
         </div>
         <div class="instructions" v-else>
           <div><kbd>SPACE</kbd> Tap to flap <strong>TAKE OFF</strong></div>
           <div><kbd>←</kbd><kbd>→</kbd> or A / D <strong>STEER</strong></div>
           <div><kbd>↓</kbd> or S to angle wings down <strong>DIVE</strong></div>
+          <div><kbd>F</kbd> or click the sky <strong>FIRE GUN</strong></div>
         </div>
-        <button class="flap-button" type="button" title="Flap wings" @click="flap">
-          <MoveUp :size="18" /> FLAP
-        </button>
+        <div class="action-buttons">
+          <button class="flap-button" type="button" title="Flap wings" @click="flap">
+            <MoveUp :size="18" /> FLAP
+          </button>
+          <button class="fire-button" type="button" title="Fire gun" @pointerdown="startFiring" @pointerup="stopFiring"
+            @pointerleave="stopFiring">
+            <Crosshair :size="18" /> FIRE
+          </button>
+        </div>
       </section>
     </div>
     <aside v-if="settingsOpen" class="settings-panel" aria-label="Flight tuning">
@@ -941,6 +961,16 @@ kbd {
   font: 700 10px 'DM Sans', sans-serif;
 }
 
+.action-buttons {
+  display: flex;
+  gap: 7px;
+  margin-top: 7px;
+}
+
+.action-buttons button {
+  flex: 1;
+}
+
 .flap-button {
   display: inline-flex;
   justify-content: center;
@@ -948,10 +978,24 @@ kbd {
   gap: 7px;
   width: 100%;
   height: 36px;
-  margin-top: 7px;
   border: 0;
   background: #cd6748;
   color: #fff9ea;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.fire-button {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 36px;
+  border: 0;
+  background: #243d34;
+  color: #f2e7cf;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 1px;
@@ -1108,7 +1152,7 @@ button:focus-visible {
     min-height: 25px;
   }
 
-  .flap-button {
+  .action-buttons {
     margin-top: 4px;
   }
 }

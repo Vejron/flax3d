@@ -3,6 +3,7 @@ import { courseRings, courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
 import type { RemoteFlight } from './network'
 import { terrainHeight } from './terrain'
+import { createGun, createWeaponRig } from './weapon'
 
 export { terrainHeight } from './terrain'
 
@@ -132,8 +133,13 @@ export function createScene(container: HTMLElement) {
         wings.push({ shoulder, elbow, side })
         flyer.add(shoulder)
     }
+    // The gun is added last so the wing shoulder groups keep their child indices.
+    const gun = createGun(flyer)
     scene.add(flyer)
+    const weapon = createWeaponRig(scene, gun.muzzle)
     const remoteFlyers = new Map<number, THREE.Group>()
+    // Remote shots reuse the shared weapon rig, so each avatar only needs its muzzle transform.
+    const remoteMuzzles = new Map<number, THREE.Object3D>()
     const remoteBadgeGeometry = new THREE.SphereGeometry(0.18, 8, 6)
     const remoteBadgeMaterial = new THREE.MeshBasicMaterial({ color: '#45dbbb' })
 
@@ -176,6 +182,10 @@ export function createScene(container: HTMLElement) {
     const trailDirection = new THREE.Vector3()
     const trailView = new THREE.Vector3()
     const trailSide = new THREE.Vector3()
+    const aimDirection = new THREE.Vector3()
+    const remoteAim = new THREE.Vector3()
+    const remoteOrigin = new THREE.Vector3()
+    const remoteQuaternion = new THREE.Quaternion()
 
     const cameraTarget = new THREE.Vector3(
         courseSpawn.x - Math.sin(courseSpawn.yaw) * 12,
@@ -198,10 +208,14 @@ export function createScene(container: HTMLElement) {
     resize()
 
     let lastFlapAt = -Infinity
-    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = []) {
+    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = [], fire = false) {
         const active = new Set(remotes.map((remote) => remote.id))
         for (const [id, avatar] of remoteFlyers) {
-            if (!active.has(id)) { scene.remove(avatar); remoteFlyers.delete(id) }
+            if (!active.has(id)) {
+                scene.remove(avatar)
+                remoteFlyers.delete(id)
+                remoteMuzzles.delete(id)
+            }
         }
         for (const remote of remotes) {
             let avatar = remoteFlyers.get(remote.id)
@@ -212,9 +226,24 @@ export function createScene(container: HTMLElement) {
                 avatar.add(badge)
                 scene.add(avatar)
                 remoteFlyers.set(remote.id, avatar)
+                const avatarMuzzle = avatar.getObjectByName('muzzle')
+                if (avatarMuzzle) remoteMuzzles.set(remote.id, avatarMuzzle)
             }
             avatar.position.set(remote.flight.x, remote.flight.y + 1.1, remote.flight.z)
             avatar.rotation.set(0, -remote.flight.yaw, remote.flight.bank)
+            // Replicate a peer's shot cosmetically: every client simulates every avatar's rounds
+            // locally, so no bullet state travels on the wire. The shared rig throttles this to
+            // that shooter's own fire interval rather than the 20 Hz packet rate.
+            if (remote.fire) {
+                const avatarMuzzle = remoteMuzzles.get(remote.id)
+                if (avatarMuzzle) {
+                    avatar.updateMatrixWorld(true)
+                    avatarMuzzle.getWorldPosition(remoteOrigin)
+                    avatarMuzzle.getWorldQuaternion(remoteQuaternion)
+                    remoteAim.set(0, 0, -1).applyQuaternion(remoteQuaternion)
+                    weapon.fire(remoteAim, remoteOrigin, remote.id)
+                }
+            }
             // Remote peers report each shoulder angle, so flapping is visible instead of guessed.
             const fallback = Math.sin(elapsed * 12) * (remote.flap ? 0.55 : 0.07) - (1 - remote.spread) * 0.85
             for (let index = 0; index < 2; index++) {
@@ -255,6 +284,14 @@ export function createScene(container: HTMLElement) {
         camera.position.lerp(cameraTarget, 1 - Math.exp(-3 * dt))
         camera.lookAt(state.x + Math.sin(cameraYaw) * 7, state.y + 1, state.z - Math.cos(cameraYaw) * 7)
         flyer.updateMatrixWorld(true)
+        // Aim along the flight path, so a dive throws rounds downward and a climb lobs them upward.
+        if (fire) {
+            const pitch = Math.atan2(state.verticalSpeed, Math.max(1, state.speed)) * 0.65
+            const cosPitch = Math.cos(pitch)
+            aimDirection.set(Math.sin(state.yaw) * cosPitch, Math.sin(pitch), -Math.cos(state.yaw) * cosPitch)
+            weapon.fire(aimDirection)
+        }
+        weapon.update(dt, terrainHeight)
         for (const trail of trails) {
             if (!state.flying || state.speed < 4) {
                 trail.points.length = 0
@@ -295,6 +332,8 @@ export function createScene(container: HTMLElement) {
 
     function dispose() {
         observer.disconnect()
+        weapon.dispose()
+        gun.dispose()
         remoteBadgeGeometry.dispose()
         remoteBadgeMaterial.dispose()
         scene.traverse((object) => {

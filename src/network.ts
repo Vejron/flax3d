@@ -6,6 +6,8 @@ export interface RemoteFlight {
     flight: Pick<FlightState, 'x' | 'y' | 'z' | 'yaw' | 'bank' | 'speed' | 'flying'> & { wingLeft: number; wingRight: number }
     spread: number
     flap: boolean
+    /** True while this peer is holding the trigger; drives a cosmetic shot on each client. */
+    fire: boolean
 }
 
 export interface WingAngles {
@@ -21,10 +23,12 @@ const DEFAULT_INTERVAL_MS = 100
  * Wire format: MessagePack arrays of fixed-point integers, so both languages encode identically and
  * packets stay small. Units are documented in NETWORKING.md and must match `server/src/main.rs`.
  */
-const MESSAGE_VERSION = 3
-const POSITION_FIELDS = 11
+const MESSAGE_VERSION = 4
+const POSITION_FIELDS = 12
 const CM = 100
 const MRAD = 1000
+/** A tap lasts a single frame, so hold the trigger on for a few updates to survive lost datagrams. */
+const FIRE_REPEAT_UPDATES = 3
 
 const EVENT_WELCOME = 0
 const EVENT_STATE = 1
@@ -37,7 +41,7 @@ const normalizeYaw = (yaw: number) => Math.atan2(Math.sin(yaw), Math.cos(yaw))
 
 type WireValue = number | boolean
 
-function encodePosition(flight: FlightState, input: FlightControls, wings: WingAngles): WireValue[] {
+function encodePosition(flight: FlightState, input: FlightControls, wings: WingAngles, fire: boolean): WireValue[] {
     return [
         quantize(flight.x, CM), quantize(flight.y, CM), quantize(flight.z, CM),
         quantize(normalizeYaw(flight.yaw), MRAD), quantize(flight.bank, MRAD),
@@ -46,14 +50,15 @@ function encodePosition(flight: FlightState, input: FlightControls, wings: WingA
         quantize(input.spread, MRAD),
         input.flap,
         quantize(wings.left, MRAD), quantize(wings.right, MRAD),
+        fire,
     ]
 }
 
-type DecodedPosition = RemoteFlight['flight'] & { spread: number; flap: boolean }
+type DecodedPosition = RemoteFlight['flight'] & { spread: number; flap: boolean; fire: boolean }
 
 /** Encodes one position update. Exported so tests can pin the exact wire bytes. */
-export function encodeUpdate(sequence: number, flight: FlightState, input: FlightControls, wings: WingAngles): Uint8Array {
-    return encode([MESSAGE_VERSION, sequence, encodePosition(flight, input, wings)])
+export function encodeUpdate(sequence: number, flight: FlightState, input: FlightControls, wings: WingAngles, fire: boolean): Uint8Array {
+    return encode([MESSAGE_VERSION, sequence, encodePosition(flight, input, wings, fire)])
 }
 
 function decodePosition(raw: unknown): DecodedPosition | null {
@@ -68,6 +73,7 @@ function decodePosition(raw: unknown): DecodedPosition | null {
         spread: scale(7, MRAD),
         flap: raw[8] === true,
         wingLeft: scale(9, MRAD), wingRight: scale(10, MRAD),
+        fire: raw[11] === true,
     }
 }
 
@@ -79,6 +85,7 @@ export class FlightNetwork {
     private sequence = 0
     private stopped = false
     private lastSent = 0
+    private fireRepeat = 0
 
     constructor(private onStatus: (status: 'CONNECTED' | 'SOLO') => void) { }
 
@@ -159,7 +166,7 @@ export class FlightNetwork {
             const position = decodePosition(message[3])
             if (!position) return
             const playerId = id as number
-            const current: RemoteFlight = { id: playerId, flight: position, spread: position.spread, flap: position.flap }
+            const current: RemoteFlight = { id: playerId, flight: position, spread: position.spread, flap: position.flap, fire: position.fire }
             const last = this.players.get(playerId)
             if (last && (sequence as number) <= last.sequence) return
             const now = performance.now()
@@ -168,10 +175,15 @@ export class FlightNetwork {
         }
     }
 
-    send(flight: FlightState, input: FlightControls, wings: WingAngles, now: number) {
+    send(flight: FlightState, input: FlightControls, wings: WingAngles, now: number, fire = false) {
         if (!this.writer || now - this.lastSent < SEND_INTERVAL_MS) return
         this.lastSent = now
-        const message = encodeUpdate(++this.sequence, flight, input, wings)
+        // Datagrams are unreliable and sent at 20 Hz, so a one-frame trigger pull is repeated
+        // across a few updates; otherwise remote clients would miss most single shots.
+        if (fire) this.fireRepeat = FIRE_REPEAT_UPDATES
+        const shot = fire || this.fireRepeat > 0
+        if (this.fireRepeat > 0) this.fireRepeat -= 1
+        const message = encodeUpdate(++this.sequence, flight, input, wings, shot)
         void this.writer.write(message).catch(() => this.disconnect())
     }
 
