@@ -14,9 +14,13 @@ RUN mkdir -p server/src \
     && cargo build --release --locked --manifest-path server/Cargo.toml \
     && rm -rf server/src
 
-# Only our crate is rebuilt after this point.
+# Only our crate is rebuilt after this point. The stub binary and its fingerprints must be removed
+# explicitly: cargo decides freshness from source mtimes, and Docker restores the context's original
+# mtimes, so a plain `cargo build` here would wrongly reuse the empty `fn main() {}` binary.
 COPY server/src server/src
-RUN cargo build --release --locked --manifest-path server/Cargo.toml
+RUN rm -rf server/target/release/flax3d-server server/target/release/deps/flax3d_server-* \
+    && find server/src -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked --manifest-path server/Cargo.toml
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
