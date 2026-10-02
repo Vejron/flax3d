@@ -11,5 +11,9 @@
     "source.fixAll": "explicit"
   },
   "editor.formatOnSave": true,
-  "editor.defaultFormatter": "oxc.oxc-vscode"
+  "editor.defaultFormatter": "oxc.oxc-vscode",
+  "chat.tools.terminal.autoApprove": {
+    "cargo clippy": true,
+    "cargo test": true
+  }
 }

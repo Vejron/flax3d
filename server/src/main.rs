@@ -21,66 +21,113 @@ use tokio::sync::broadcast;
 
 const MAX_PLAYERS: usize = 32;
 const MAX_PACKET: usize = 512;
+/// Wire schema version, mirrored by `MESSAGE_VERSION` in `src/network.ts`.
+const MESSAGE_VERSION: u8 = 4;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Fixed-point wire position. Units mirror `src/network.ts` and are documented in NETWORKING.md.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct Position {
-    x: f32,
-    y: f32,
-    z: f32,
-    yaw: f32,
-    bank: f32,
-    speed: f32,
+    /// Centimetres.
+    x: i32,
+    y: i32,
+    z: i32,
+    /// Milliradians, wrapped to `[-π, π)` by the sender.
+    yaw: i16,
+    /// Milliradians.
+    bank: i16,
+    /// Centimetres per second.
+    speed: u16,
     flying: bool,
-    spread: f32,
+    /// Milli-units in `0..=1000`.
+    spread: u16,
     flap: bool,
+    /// Shoulder angles in milliradians.
+    wing_left: i16,
+    wing_right: i16,
+    /// True while the sender is holding the trigger. Relayed so peers can play a cosmetic shot.
+    fire: bool,
 }
 
 impl Position {
     fn valid(&self) -> bool {
-        [
-            self.x,
-            self.y,
-            self.z,
-            self.yaw,
-            self.bank,
-            self.speed,
-            self.spread,
-        ]
-        .iter()
-        .all(|value| value.is_finite())
-            && self.x.abs() <= 450.0
-            && self.z.abs() <= 450.0
-            && (-50.0..=300.0).contains(&self.y)
-            && self.yaw.abs() <= 100_000.0
-            && self.bank.abs() <= 1.0
-            && (0.0..=100.0).contains(&self.speed)
-            && (0.0..=1.0).contains(&self.spread)
+        self.x.abs() <= 45_000
+            && self.z.abs() <= 45_000
+            && (-5_000..=30_000).contains(&self.y)
+            && self.yaw.abs() <= 4_000
+            && self.bank.abs() <= 1_000
+            && self.speed <= 10_000
+            && self.spread <= 1_000
+            && self.wing_left.abs() <= 2_000
+            && self.wing_right.abs() <= 2_000
     }
 }
 
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            z: 0,
+            yaw: 0,
+            bank: 0,
+            speed: 0,
+            flying: false,
+            spread: 1_000,
+            flap: false,
+            wing_left: 0,
+            wing_right: 0,
+            fire: false,
+        }
+    }
+}
+
+/// Client update: `[version, sequence, position]` as a MessagePack array.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Update {
-    v: u8,
+struct Update(u8, u32, Position);
+
+#[derive(Clone)]
+struct Event {
+    kind: EventKind,
+    id: u64,
     sequence: u32,
     position: Position,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum Event {
-    Welcome {
-        id: u64,
-    },
-    State {
-        id: u64,
-        sequence: u32,
-        position: Position,
-    },
-    Leave {
-        id: u64,
-    },
+#[derive(Clone, Copy)]
+enum EventKind {
+    Welcome,
+    State,
+    Leave,
+}
+
+impl Event {
+    fn welcome(id: u64) -> Self {
+        Self { kind: EventKind::Welcome, id, sequence: 0, position: Position::default() }
+    }
+
+    fn state(id: u64, sequence: u32, position: Position) -> Self {
+        Self { kind: EventKind::State, id, sequence, position }
+    }
+
+    fn leave(id: u64) -> Self {
+        Self { kind: EventKind::Leave, id, sequence: 0, position: Position::default() }
+    }
+}
+
+const EVENT_WELCOME: u8 = 0;
+const EVENT_STATE: u8 = 1;
+const EVENT_LEAVE: u8 = 2;
+
+fn event_bytes(event: &Event) -> Result<Bytes, salvo::Error> {
+    let bytes = match event.kind {
+        EventKind::Welcome => rmp_serde::to_vec(&(EVENT_WELCOME, event.id)),
+        EventKind::State => {
+            rmp_serde::to_vec(&(EVENT_STATE, event.id, event.sequence, &event.position))
+        }
+        EventKind::Leave => rmp_serde::to_vec(&(EVENT_LEAVE, event.id)),
+    }
+    .map_err(salvo::Error::other)?;
+    Ok(Bytes::from(bytes))
 }
 
 #[derive(Clone)]
@@ -103,7 +150,7 @@ struct PlayerGuard {
 impl Drop for PlayerGuard {
     fn drop(&mut self) {
         self.room.players.lock().unwrap().remove(&self.id);
-        let _ = self.room.events.send(Event::Leave { id: self.id });
+        let _ = self.room.events.send(Event::leave(self.id));
     }
 }
 
@@ -144,12 +191,6 @@ fn local_certificate() -> Result<(RustlsConfig, CertificateHash)> {
     Ok((config, CertificateHash(hash)))
 }
 
-fn event_bytes(event: &Event) -> Result<Bytes, salvo::Error> {
-    Ok(Bytes::from(
-        serde_json::to_vec(event).map_err(salvo::Error::other)?,
-    ))
-}
-
 struct Relay {
     room: Arc<Room>,
     domain: Option<String>,
@@ -186,27 +227,15 @@ impl Relay {
             }
             let snapshot = players
                 .iter()
-                .map(|(&id, player)| Event::State {
-                    id,
-                    sequence: player.sequence,
-                    position: player.position.clone(),
+                .map(|(&id, player)| {
+                    Event::state(id, player.sequence, player.position.clone())
                 })
                 .collect::<Vec<_>>();
             players.insert(
                 id,
                 Player {
                     sequence: 0,
-                    position: Position {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                        yaw: 0.0,
-                        bank: 0.0,
-                        speed: 0.0,
-                        flying: false,
-                        spread: 1.0,
-                        flap: false,
-                    },
+                    position: Position::default(),
                 },
             );
             snapshot
@@ -220,7 +249,7 @@ impl Relay {
         let mut sender = session.datagram_sender();
         let mut stream = session.open_uni(session_id).await?;
         stream
-            .write_all(&event_bytes(&Event::Welcome { id })?)
+            .write_all(&event_bytes(&Event::welcome(id))?)
             .await?;
         stream.shutdown().await?;
         for player in &snapshot {
@@ -234,26 +263,24 @@ impl Relay {
                 incoming = reader.read_datagram() => {
                     let Ok(datagram) = incoming else { break };
                     let payload = datagram.into_payload();
-                    if payload.len() > MAX_PACKET || last_update.elapsed() < StdDuration::from_millis(40) { continue; }
-                    let Ok(update) = serde_json::from_slice::<Update>(&payload) else { continue };
-                    if update.v != 1 || !update.position.valid() { continue; }
+                    if payload.len() > MAX_PACKET || last_update.elapsed() < StdDuration::from_millis(25) { continue; }
+                    let Ok(update) = rmp_serde::from_slice::<Update>(&payload) else { continue };
+                    if update.0 != MESSAGE_VERSION || !update.2.valid() { continue; }
                     {
                         let mut players = room.players.lock().unwrap();
                         let Some(player) = players.get_mut(&id) else { break };
-                        if update.sequence <= player.sequence { continue; }
-                        player.sequence = update.sequence;
-                        player.position = update.position.clone();
+                        if update.1 <= player.sequence { continue; }
+                        player.sequence = update.1;
+                        player.position = update.2.clone();
                     }
                     last_update = Instant::now();
-                    let _ = room.events.send(Event::State {
-                        id, sequence: update.sequence, position: update.position,
-                    });
+                    let _ = room.events.send(Event::state(id, update.1, update.2));
                 }
                 outgoing = events.recv() => {
                     match outgoing {
                         Ok(event) => {
-                            if matches!(&event, Event::State { id: sender_id, .. } if *sender_id == id) { continue; }
-                            if matches!(event, Event::State { .. }) {
+                            if event.id == id && matches!(event.kind, EventKind::State) { continue; }
+                            if matches!(event.kind, EventKind::State) {
                                 if sender.send_datagram(event_bytes(&event)?).is_err() { break; }
                             } else {
                                 let mut stream = session.open_uni(session_id).await?;
@@ -340,43 +367,68 @@ mod tests {
     use super::*;
 
     fn position() -> Position {
-        Position {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            yaw: 0.0,
-            bank: 0.0,
-            speed: 0.0,
-            flying: false,
-            spread: 1.0,
-            flap: false,
-        }
+        Position::default()
     }
 
     #[test]
-    fn rejects_invalid_positions() {
+    fn rejects_out_of_range_positions() {
         assert!(position().valid());
-        assert!(
-            !Position {
-                x: f32::NAN,
-                ..position()
+        assert!(!Position { x: 45_001, ..position() }.valid());
+        assert!(!Position { z: -45_001, ..position() }.valid());
+        assert!(!Position { y: -5_001, ..position() }.valid());
+        assert!(!Position { yaw: 4_001, ..position() }.valid());
+        assert!(!Position { bank: 1_001, ..position() }.valid());
+        assert!(!Position { speed: 10_001, ..position() }.valid());
+        assert!(!Position { spread: 1_001, ..position() }.valid());
+        assert!(!Position { wing_left: -2_001, ..position() }.valid());
+        assert!(!Position { wing_right: 2_001, ..position() }.valid());
+    }
+
+    /// Byte-for-byte fixture emitted by `encodeUpdate` in `src/network.ts`. If this breaks, the two
+    /// languages have drifted apart.
+    #[test]
+    fn decodes_a_client_update_fixture() {
+        let fixture: &[u8] = &[
+            147, 4, 7, 156, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
+            5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 195,
+        ];
+        let Update(version, sequence, position) = rmp_serde::from_slice(fixture).unwrap();
+        assert_eq!(version, MESSAGE_VERSION);
+        assert_eq!(sequence, 7);
+        assert_eq!(
+            position,
+            Position {
+                x: 1_234,
+                y: -4_550,
+                z: 900,
+                yaw: 1_571,
+                bank: -480,
+                speed: 1_500,
+                flying: true,
+                spread: 1_000,
+                flap: false,
+                wing_left: -250,
+                wing_right: 850,
+                fire: true,
             }
-            .valid()
         );
-        assert!(
-            !Position {
-                spread: 1.2,
-                ..position()
-            }
-            .valid()
-        );
-        assert!(
-            !Position {
-                x: 451.0,
-                ..position()
-            }
-            .valid()
-        );
+        assert!(position.valid());
+    }
+
+    #[test]
+    fn encodes_events_as_tagged_arrays() {
+        let welcome = event_bytes(&Event::welcome(4)).unwrap();
+        assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&welcome).unwrap(), (EVENT_WELCOME, 4));
+
+        let leave = event_bytes(&Event::leave(4)).unwrap();
+        assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&leave).unwrap(), (EVENT_LEAVE, 4));
+
+        let state = event_bytes(&Event::state(9, 3, position())).unwrap();
+        let (kind, id, sequence, decoded) =
+            rmp_serde::from_slice::<(u8, u64, u32, Position)>(&state).unwrap();
+        assert_eq!((kind, id, sequence), (EVENT_STATE, 9, 3));
+        assert_eq!(decoded, position());
+        assert!(state.len() < 64);
     }
 
     #[test]
