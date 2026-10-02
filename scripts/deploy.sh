@@ -7,6 +7,7 @@ domain="${DEPLOY_DOMAIN:-remote.intinor.uk}"
 remote_dir="${DEPLOY_REMOTE_DIR:-/opt/flax3d}"
 platform="${DEPLOY_PLATFORM:-linux/amd64}"
 health_timeout="${DEPLOY_HEALTH_TIMEOUT:-180}"
+cargo_jobs="${DEPLOY_CARGO_JOBS:-4}"
 release="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 image="flax3d:${release}"
 rollback_name="flax3d-rollback-${release}"
@@ -19,6 +20,7 @@ die() {
 [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "invalid domain: $domain"
 [[ "$remote_dir" == /* && "$remote_dir" != *..* ]] || die "remote directory must be an absolute safe path"
 [[ "$health_timeout" =~ ^[0-9]+$ ]] || die "health timeout must be a number of seconds"
+[[ "$cargo_jobs" =~ ^[0-9]+$ ]] || die "cargo jobs must be a number"
 
 for tool in npm docker ssh gzip; do
   command -v "$tool" >/dev/null 2>&1 || die "required command not found: $tool"
@@ -42,7 +44,7 @@ npm ci
 npm run build
 
 printf 'Building %s image...\n' "$image"
-docker build --platform "$platform" --tag "$image" .
+docker build --platform "$platform" --build-arg "CARGO_BUILD_JOBS=$cargo_jobs" --tag "$image" .
 
 printf 'Transferring image to %s...\n' "$deploy_host"
 docker save "$image" | gzip -1 | ssh "$deploy_host" 'bash -o pipefail -c "gzip -dc | docker load"'
@@ -139,4 +141,16 @@ printf 'Deployment healthy: https://%s/\n' "$domain"
 if [[ "$had_previous" == 1 ]]; then
   printf 'Previous container retained as %s.\n' "$rollback_name"
 fi
+
+# Retain at most one rollback: remove any older ones now that this release is proven healthy.
+for stale in $(docker ps -a --format '{{.Names}}' | grep -E '^flax3d-rollback-' || true); do
+  if [[ "$stale" != "$rollback_name" ]]; then
+    stale_image="$(docker inspect --format '{{.Config.Image}}' "$stale" 2>/dev/null || true)"
+    if [[ "$stale_image" == flax3d:* ]]; then
+      if docker rm -f "$stale" >/dev/null 2>&1; then
+        printf 'Removed older rollback container %s.\n' "$stale"
+      fi
+    fi
+  fi
+done
 REMOTE_DEPLOY
