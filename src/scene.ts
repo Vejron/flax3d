@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { courseRings, courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
+import type { RemoteFlight } from './network'
 import { terrainHeight } from './terrain'
 
 export { terrainHeight } from './terrain'
@@ -132,6 +133,9 @@ export function createScene(container: HTMLElement) {
         flyer.add(shoulder)
     }
     scene.add(flyer)
+    const remoteFlyers = new Map<number, THREE.Group>()
+    const remoteBadgeGeometry = new THREE.SphereGeometry(0.18, 8, 6)
+    const remoteBadgeMaterial = new THREE.MeshBasicMaterial({ color: '#45dbbb' })
 
     const courseMarkers = courseRings.map((ring) => {
         const color = ring.kind === 'start' ? '#45dbbb' : ring.kind === 'finish' ? '#ffd07e' : '#e4f5ee'
@@ -194,7 +198,28 @@ export function createScene(container: HTMLElement) {
     resize()
 
     let lastFlapAt = -Infinity
-    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number) {
+    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = []) {
+        const active = new Set(remotes.map((remote) => remote.id))
+        for (const [id, avatar] of remoteFlyers) {
+            if (!active.has(id)) { scene.remove(avatar); remoteFlyers.delete(id) }
+        }
+        for (const remote of remotes) {
+            let avatar = remoteFlyers.get(remote.id)
+            if (!avatar) {
+                avatar = flyer.clone(true)
+                const badge = new THREE.Mesh(remoteBadgeGeometry, remoteBadgeMaterial)
+                badge.position.y = 2.35
+                avatar.add(badge)
+                scene.add(avatar)
+                remoteFlyers.set(remote.id, avatar)
+            }
+            avatar.position.set(remote.flight.x, remote.flight.y + 1.1, remote.flight.z)
+            avatar.rotation.set(0, -remote.flight.yaw, remote.flight.bank)
+            const wingAngle = Math.sin(elapsed * 12) * (remote.flap ? 0.55 : 0.07) - (1 - remote.spread) * 0.85
+            for (let index = 0; index < 2; index++) {
+                avatar.children[index + 2]!.rotation.z = (index === 0 ? -1 : 1) * wingAngle
+            }
+        }
         courseMarkers.forEach((material, index) => { material.emissiveIntensity = index === nextRing ? 1.8 : 0.4 })
         if (input.flap) lastFlapAt = elapsed
         const beat = Math.sin(Math.min(1, (elapsed - lastFlapAt) / 0.45) * Math.PI * 2) * 0.62
@@ -256,6 +281,8 @@ export function createScene(container: HTMLElement) {
 
     function dispose() {
         observer.disconnect()
+        remoteBadgeGeometry.dispose()
+        remoteBadgeMaterial.dispose()
         scene.traverse((object) => {
             if (object instanceof THREE.Mesh) object.geometry.dispose()
         })

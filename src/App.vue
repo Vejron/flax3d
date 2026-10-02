@@ -4,6 +4,7 @@ import { Camera, CameraOff, Crosshair, MoveUp, RotateCcw, SlidersHorizontal, Win
 import type { Pose, PoseDetector } from '@tensorflow-models/pose-detection'
 import { advanceCourse, courseRings, courseSpawn, type CourseProgress } from './course'
 import { flightConfig, initialFlightState, stepFlight, type FlightConfig, type FlightControls } from './flight'
+import { FlightNetwork } from './network'
 import { PoseControls } from './poseControls'
 import { createScene, terrainHeight } from './scene'
 
@@ -14,6 +15,8 @@ const flight = ref({ ...initialFlightState(terrainHeight(courseSpawn.x, courseSp
 const course = ref<CourseProgress>({ nextRing: 0, laps: 0 })
 const cameraStatus = ref<'off' | 'loading' | 'tracking' | 'lost'>('off')
 const error = ref('')
+const networkStatus = ref('SOLO')
+const nearbyPlayers = ref(0)
 const controls = ref<FlightControls>({ flap: false, steer: 0, spread: 1 })
 const liftOutput = ref(0)
 const settingsOpen = ref(false)
@@ -85,6 +88,27 @@ let poseFrame = 0
 let lastFrame = 0
 let scene: ReturnType<typeof createScene> | null = null
 let running = false
+let network: FlightNetwork | null = null
+let reconnectTimer = 0
+
+function connectNetwork() {
+  if (!running) return
+  network?.close()
+  networkStatus.value = 'CONNECTING'
+  network = new FlightNetwork((status) => {
+    if (!running) return
+    networkStatus.value = status
+    if (status === 'SOLO' && !reconnectTimer) {
+      reconnectTimer = window.setTimeout(() => { reconnectTimer = 0; connectNetwork() }, 3000)
+    }
+  })
+  network.connect().catch(() => {
+    if (running && !reconnectTimer) {
+      networkStatus.value = 'SOLO'
+      reconnectTimer = window.setTimeout(() => { reconnectTimer = 0; connectNetwork() }, 3000)
+    }
+  })
+}
 
 function keyDown(event: KeyboardEvent) {
   if (event.code === 'Escape') settingsOpen.value = false
@@ -156,9 +180,12 @@ function frame(now: number) {
   flapQueued = false
   const previousFlight = flight.value
   flight.value = stepFlight(previousFlight, input, dt, terrainHeight, tuning)
+  network?.send(flight.value, input, now)
   course.value = advanceCourse(course.value, previousFlight, flight.value)
   liftOutput.value += ((input.flap ? 1 : Math.min(1, (input.flapPower ?? 0) / tuning.maxWingPower)) - liftOutput.value) * Math.min(1, dt * 12)
-  scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing)
+  const remotes = network?.remotes(now) ?? []
+  nearbyPlayers.value = remotes.length
+  scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes)
   renderFrame = requestAnimationFrame(frame)
 }
 
@@ -237,10 +264,13 @@ onMounted(() => {
   renderFrame = requestAnimationFrame(frame)
   window.addEventListener('keydown', keyDown)
   window.addEventListener('keyup', keyUp)
+  connectNetwork()
 })
 
 onBeforeUnmount(() => {
   running = false
+  clearTimeout(reconnectTimer)
+  network?.close()
   cancelAnimationFrame(renderFrame)
   stopCamera()
   scene?.dispose()
@@ -256,7 +286,8 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="brand"><span class="brand-mark">F<span>·</span></span><span>FLAX <small>FLIGHT LAB</small></span>
       </div>
-      <div class="flight-status"><span class="status-light" :class="{ active: flight.flying }" />{{ mode }}</div>
+      <div class="flight-status"><span class="status-light" :class="{ active: flight.flying }" />{{ mode }} · {{
+        networkStatus === 'CONNECTED' ? `${nearbyPlayers + 1} ONLINE` : networkStatus }}</div>
       <div class="top-actions">
         <div class="top-readout"><span>ALTITUDE</span><strong>{{ altitude.toFixed(1) }} <small>m</small></strong></div>
         <button class="settings-toggle" type="button" title="Flight settings" aria-label="Flight settings"
@@ -270,7 +301,7 @@ onBeforeUnmount(() => {
       <div class="metric"><span>01 / AIRSPEED</span><strong>{{ Math.round(flight.speed * 3.6) }}<small>
             km/h</small></strong></div>
       <div class="metric"><span>02 / HEADING</span><strong>{{ ((flight.yaw * 180 / Math.PI + 360) % 360).toFixed(0)
-          }}<small>°</small></strong></div>
+      }}<small>°</small></strong></div>
       <div class="metric course-metric"><span>03 / COURSE</span><strong>{{ courseRings[course.nextRing]?.kind ===
         'checkpoint' ?
         `${course.nextRing} / ${courseRings.length - 2}` : courseRings[course.nextRing]?.kind?.toUpperCase() }}<small>
@@ -317,7 +348,7 @@ onBeforeUnmount(() => {
       <section class="instruction-panel" aria-label="Flight controls">
         <div class="instruction-heading">
           <Wind :size="18" /> <span>{{ cameraStatus === 'tracking' ? 'FLY WITH YOUR BODY' : 'FLY WITH YOUR KEYBOARD'
-            }}</span>
+          }}</span>
         </div>
         <div class="instructions" v-if="cameraStatus === 'tracking'">
           <div><span>01</span> Raise & lower both arms <strong>FLAP</strong></div>
