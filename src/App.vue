@@ -180,12 +180,12 @@ function frame(now: number) {
   flapQueued = false
   const previousFlight = flight.value
   flight.value = stepFlight(previousFlight, input, dt, terrainHeight, tuning)
-  network?.send(flight.value, input, now)
   course.value = advanceCourse(course.value, previousFlight, flight.value)
   liftOutput.value += ((input.flap ? 1 : Math.min(1, (input.flapPower ?? 0) / tuning.maxWingPower)) - liftOutput.value) * Math.min(1, dt * 12)
   const remotes = network?.remotes(now) ?? []
   nearbyPlayers.value = remotes.length
-  scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes)
+  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes)
+  network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now)
   renderFrame = requestAnimationFrame(frame)
 }
 

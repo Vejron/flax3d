@@ -215,20 +215,33 @@ export function createScene(container: HTMLElement) {
             }
             avatar.position.set(remote.flight.x, remote.flight.y + 1.1, remote.flight.z)
             avatar.rotation.set(0, -remote.flight.yaw, remote.flight.bank)
-            const wingAngle = Math.sin(elapsed * 12) * (remote.flap ? 0.55 : 0.07) - (1 - remote.spread) * 0.85
+            // Remote peers report each shoulder angle, so flapping is visible instead of guessed.
+            const fallback = Math.sin(elapsed * 12) * (remote.flap ? 0.55 : 0.07) - (1 - remote.spread) * 0.85
             for (let index = 0; index < 2; index++) {
-                avatar.children[index + 2]!.rotation.z = (index === 0 ? -1 : 1) * wingAngle
+                const side = index === 0 ? -1 : 1
+                const reported = index === 0 ? remote.flight.wingLeft : remote.flight.wingRight
+                const wingAngle = Number.isFinite(reported) ? reported : fallback
+                const shoulder = avatar.children[index + 2]!
+                const lag = wingAngle - shoulder.rotation.z * side
+                const tip = THREE.MathUtils.clamp(-0.1 + wingAngle * 0.3 - lag * 0.65, -0.65, 0.65)
+                shoulder.rotation.z += (side * wingAngle - shoulder.rotation.z) * 0.25
+                const elbow = shoulder.children[1]
+                if (elbow) elbow.rotation.z += (side * tip - elbow.rotation.z) * 0.16
             }
         }
         courseMarkers.forEach((material, index) => { material.emissiveIntensity = index === nextRing ? 1.8 : 0.4 })
         if (input.flap) lastFlapAt = elapsed
         const beat = Math.sin(Math.min(1, (elapsed - lastFlapAt) / 0.45) * Math.PI * 2) * 0.62
+        const localWings = { left: 0, right: 0 }
         for (const { shoulder, elbow, side } of wings) {
             const angle = poseWings ? (side < 0 ? poseWings.leftWing : poseWings.rightWing) : beat - (1 - input.spread) * 0.85
             const lag = angle - shoulder.rotation.z * side
             const tip = THREE.MathUtils.clamp(-0.1 + angle * 0.3 - lag * 0.65, -0.65, 0.65)
             shoulder.rotation.z += (side * angle - shoulder.rotation.z) * 0.25
             elbow.rotation.z += (side * tip - elbow.rotation.z) * 0.16
+            const current = shoulder.rotation.z * side
+            if (side < 0) localWings.left = current
+            else localWings.right = current
         }
         head.rotation.y += ((poseHead?.yaw ?? 0) - head.rotation.y) * 0.18
         head.rotation.z += ((poseHead?.tilt ?? 0) - head.rotation.z) * 0.18
@@ -277,6 +290,7 @@ export function createScene(container: HTMLElement) {
             trail.geometry.setDrawRange(0, Math.max(0, count - 1) * 6)
         }
         renderer.render(scene, camera)
+        return localWings
     }
 
     function dispose() {

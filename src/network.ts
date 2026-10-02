@@ -1,19 +1,80 @@
+import { decode, encode } from '@msgpack/msgpack'
 import type { FlightControls, FlightState } from './flight'
 
 export interface RemoteFlight {
     id: number
-    flight: Pick<FlightState, 'x' | 'y' | 'z' | 'yaw' | 'bank' | 'speed' | 'flying'>
+    flight: Pick<FlightState, 'x' | 'y' | 'z' | 'yaw' | 'bank' | 'speed' | 'flying'> & { wingLeft: number; wingRight: number }
     spread: number
     flap: boolean
 }
 
-type StateEvent = { type: 'state'; id: number; sequence: number; position: RemoteFlight['flight'] & { spread: number; flap: boolean } }
-type NetworkEvent = StateEvent | { type: 'welcome' | 'leave'; id: number }
+export interface WingAngles {
+    left: number
+    right: number
+}
+
+/** Position updates are sent at 20 Hz; remote motion is interpolated across the measured arrival gap. */
+const SEND_INTERVAL_MS = 50
+const DEFAULT_INTERVAL_MS = 100
+
+/**
+ * Wire format: MessagePack arrays of fixed-point integers, so both languages encode identically and
+ * packets stay small. Units are documented in NETWORKING.md and must match `server/src/main.rs`.
+ */
+const MESSAGE_VERSION = 3
+const POSITION_FIELDS = 11
+const CM = 100
+const MRAD = 1000
+
+const EVENT_WELCOME = 0
+const EVENT_STATE = 1
+const EVENT_LEAVE = 2
+
+const quantize = (value: number, scale: number) => (Number.isFinite(value) ? Math.round(value * scale) : 0)
+
+/** yaw is unbounded locally; wrapping it keeps a 16-bit milliradian field precise. */
+const normalizeYaw = (yaw: number) => Math.atan2(Math.sin(yaw), Math.cos(yaw))
+
+type WireValue = number | boolean
+
+function encodePosition(flight: FlightState, input: FlightControls, wings: WingAngles): WireValue[] {
+    return [
+        quantize(flight.x, CM), quantize(flight.y, CM), quantize(flight.z, CM),
+        quantize(normalizeYaw(flight.yaw), MRAD), quantize(flight.bank, MRAD),
+        quantize(flight.speed, CM),
+        flight.flying,
+        quantize(input.spread, MRAD),
+        input.flap,
+        quantize(wings.left, MRAD), quantize(wings.right, MRAD),
+    ]
+}
+
+type DecodedPosition = RemoteFlight['flight'] & { spread: number; flap: boolean }
+
+/** Encodes one position update. Exported so tests can pin the exact wire bytes. */
+export function encodeUpdate(sequence: number, flight: FlightState, input: FlightControls, wings: WingAngles): Uint8Array {
+    return encode([MESSAGE_VERSION, sequence, encodePosition(flight, input, wings)])
+}
+
+function decodePosition(raw: unknown): DecodedPosition | null {
+    if (!Array.isArray(raw) || raw.length !== POSITION_FIELDS) return null
+    const numbers = [raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[7], raw[9], raw[10]]
+    if (!numbers.every((value) => typeof value === 'number' && Number.isFinite(value))) return null
+    const scale = (index: number, factor: number) => (raw[index] as number) / factor
+    return {
+        x: scale(0, CM), y: scale(1, CM), z: scale(2, CM),
+        yaw: scale(3, MRAD), bank: scale(4, MRAD), speed: scale(5, CM),
+        flying: raw[6] === true,
+        spread: scale(7, MRAD),
+        flap: raw[8] === true,
+        wingLeft: scale(9, MRAD), wingRight: scale(10, MRAD),
+    }
+}
 
 export class FlightNetwork {
     private transport: WebTransport | null = null
     private writer: WritableStreamDefaultWriter<Uint8Array> | null = null
-    private players = new Map<number, { previous: RemoteFlight; current: RemoteFlight; receivedAt: number; sequence: number }>()
+    private players = new Map<number, { previous: RemoteFlight; current: RemoteFlight; receivedAt: number; sequence: number; interval: number }>()
     private id: number | null = null
     private sequence = 0
     private stopped = false
@@ -83,39 +144,42 @@ export class FlightNetwork {
     }
 
     private handleEvent(bytes: Uint8Array) {
-        let event: NetworkEvent
-        try { event = JSON.parse(new TextDecoder().decode(bytes)) as NetworkEvent } catch { return }
-        if (!Number.isSafeInteger(event.id)) return
-        if (event.type === 'welcome') {
-            this.id = event.id
-            this.players.delete(event.id)
-        } else if (event.type === 'leave') {
-            this.players.delete(event.id)
-        } else if (event.type === 'state' && event.id !== this.id && Number.isSafeInteger(event.sequence)) {
-            const position = event.position
-            if (!position || ![position.x, position.y, position.z, position.yaw, position.bank, position.speed, position.spread].every(Number.isFinite)) return
-            const current: RemoteFlight = { id: event.id, flight: position, spread: position.spread, flap: position.flap }
-            const last = this.players.get(event.id)
-            if (last && event.sequence <= last.sequence) return
-            this.players.set(event.id, { previous: last?.current ?? current, current, receivedAt: performance.now(), sequence: event.sequence })
+        let message: unknown
+        try { message = decode(bytes) } catch { return }
+        if (!Array.isArray(message)) return
+        if (message[0] === EVENT_WELCOME && message.length === 2 && Number.isSafeInteger(message[1])) {
+            this.id = message[1] as number
+            this.players.delete(this.id)
+        } else if (message[0] === EVENT_LEAVE && message.length === 2 && Number.isSafeInteger(message[1])) {
+            this.players.delete(message[1] as number)
+        } else if (message[0] === EVENT_STATE && message.length === 4) {
+            const id = message[1]
+            const sequence = message[2]
+            if (!Number.isSafeInteger(id) || id === this.id || !Number.isSafeInteger(sequence)) return
+            const position = decodePosition(message[3])
+            if (!position) return
+            const playerId = id as number
+            const current: RemoteFlight = { id: playerId, flight: position, spread: position.spread, flap: position.flap }
+            const last = this.players.get(playerId)
+            if (last && (sequence as number) <= last.sequence) return
+            const now = performance.now()
+            const interval = last ? Math.min(300, Math.max(40, now - last.receivedAt)) : DEFAULT_INTERVAL_MS
+            this.players.set(playerId, { previous: last?.current ?? current, current, receivedAt: now, sequence: sequence as number, interval })
         }
     }
 
-    send(flight: FlightState, input: FlightControls, now: number) {
-        if (!this.writer || now - this.lastSent < 100) return
+    send(flight: FlightState, input: FlightControls, wings: WingAngles, now: number) {
+        if (!this.writer || now - this.lastSent < SEND_INTERVAL_MS) return
         this.lastSent = now
-        const position = {
-            x: flight.x, y: flight.y, z: flight.z, yaw: flight.yaw, bank: flight.bank,
-            speed: flight.speed, flying: flight.flying, spread: input.spread, flap: input.flap
-        }
-        void this.writer.write(new TextEncoder().encode(JSON.stringify({ v: 1, sequence: ++this.sequence, position }))).catch(() => this.disconnect())
+        const message = encodeUpdate(++this.sequence, flight, input, wings)
+        void this.writer.write(message).catch(() => this.disconnect())
     }
 
     remotes(now: number): RemoteFlight[] {
         const result: RemoteFlight[] = []
         for (const [id, player] of this.players) {
             if (now - player.receivedAt > 3000) { this.players.delete(id); continue }
-            const fraction = Math.max(0, Math.min(1, (now - player.receivedAt) / 100))
+            const fraction = Math.max(0, Math.min(1, (now - player.receivedAt) / player.interval))
             const previous = player.previous.flight
             const current = player.current.flight
             const angle = Math.atan2(Math.sin(current.yaw - previous.yaw), Math.cos(current.yaw - previous.yaw))
@@ -127,6 +191,8 @@ export class FlightNetwork {
                     z: previous.z + (current.z - previous.z) * fraction,
                     yaw: previous.yaw + angle * fraction,
                     bank: previous.bank + (current.bank - previous.bank) * fraction,
+                    wingLeft: previous.wingLeft + (current.wingLeft - previous.wingLeft) * fraction,
+                    wingRight: previous.wingRight + (current.wingRight - previous.wingRight) * fraction,
                 }
             })
         }

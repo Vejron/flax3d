@@ -57,7 +57,8 @@ npm run lint
 
 ## Multiplayer (local)
 
-The Rust server requires a current Rust toolchain. Start the frontend and server in separate terminals from the repository root:
+The Rust server requires a current Rust toolchain. For the wire protocol, transport mapping, and
+message formats, see [NETWORKING.md](NETWORKING.md). Start the frontend and server in separate terminals from the repository root:
 
 ```sh
 npm install
