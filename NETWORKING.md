@@ -82,11 +82,12 @@ exactly.
 | `spread` | milli-units | ×1000 | `u16` | `0..=1000` |
 | `flap`, `flying`, `fire` | boolean | — | bool | — |
 | `wingLeft`, `wingRight` | milliradians | ×1000 | `i16` | `±2000` |
+| `health` | hit points | ×1 | `u8` | `0..=100` |
 
 ### Client → server: `Update`
 
 ```text
-[ 4, sequence, [ x, y, z, yaw, bank, speed, flying, spread, flap, wingLeft, wingRight, fire ] ]
+[ 5, sequence, [ x, y, z, yaw, bank, speed, flying, spread, flap, wingLeft, wingRight, fire, health ] ]
 ```
 
 - `sequence` is a per-connection counter incremented on every send.
@@ -102,7 +103,35 @@ exactly.
   (~100 ms, just under the 110 ms fire interval) — enough to survive a lost datagram while still
   producing exactly one shot. Holding the trigger keeps it true and each client throttles its own
   shots with the fire interval.
+- `health` is the sender's own hit points, clamped to `0..=100`. Only the owning client writes it; a
+  value of zero means the sender is a wreck and cannot be hit again until it respawns.
 - Sent via `encodeUpdate` at most once every 50 ms (20 Hz).
+
+### Client → server: `Hit`
+
+```text
+[ 0, victim ]
+```
+
+- Sent when one of this client's rounds strikes another bird. The tag `0` cannot collide with an
+  update, whose first field is the version, and the two shapes are disjoint (two fields vs three),
+  so the server decodes an update first and falls back to a hit report.
+- The report names only the victim: the shooter never sends a health value, so a client can never
+  dictate anyone else's health directly. The server stamps the shooter id and drops reports where
+  the victim is the sender, is not in the room, or when the sender is reporting faster than 25 ms.
+
+### Client → server: `Ping`
+
+```text
+[ 1, nonce ]
+```
+
+- Sent about once per second so the client can display a round-trip latency in the HUD.
+- The tag `1` cannot collide with an update (whose first field is the version `5`) or a hit report
+  (tag `0`): the server tries `Update` first and then reads the two-field form, dispatching on tag.
+- The server keeps no timing state. It echoes the nonce straight back as a `pong`, so the client
+  measures the whole round trip with its own clock. A server that predates the probe simply never
+  replies and the HUD shows `-- ms`.
 
 ### Server → client: `Event`
 
@@ -110,8 +139,10 @@ Tagged by a leading integer:
 
 ```text
 welcome: [ 0, id ]
-state:   [ 1, id, sequence, [ ...same 12 position values... ] ]
+state:   [ 1, id, sequence, [ ...same 13 position values... ] ]
 leave:   [ 2, id ]
+hit:     [ 3, shooter, victim ]
+pong:    [ 4, nonce ]
 ```
 
 ## Transport mapping
@@ -120,6 +151,10 @@ leave:   [ 2, id ]
 | --- | --- | --- |
 | `Update` (positions) | QUIC datagram | Unreliable, unordered |
 | `state` relay (positions) | QUIC datagram | Unreliable, unordered |
+| `Hit` (hit report) | QUIC datagram | Unreliable, unordered |
+| `hit` relay | Unidirectional stream | Reliable, ordered |
+| `Ping` (latency probe) | QUIC datagram | Unreliable, unordered |
+| `pong` (latency echo) | QUIC datagram | Unreliable, unordered |
 | `welcome` | Unidirectional stream | Reliable, ordered |
 | `state` snapshot on join | Unidirectional stream | Reliable, ordered |
 | `leave` | Unidirectional stream | Reliable, ordered |
@@ -132,28 +167,32 @@ reliable streams instead. Well-known ports: QUIC runs on UDP 443 in production.
 
 Server-side (`Position::valid`, `MAX_PACKET`):
 
-- Rejects packets larger than `MAX_PACKET` (512 bytes). A real update encodes to about 34 bytes.
-- Rejects datagrams that fail to deserialize as `Update`.
-- Requires `v == 4` (see the migration note below).
+- Rejects packets larger than `MAX_PACKET` (512 bytes). A real update encodes to about 35 bytes.
+- Rejects datagrams that fail to deserialize as `Update` or as a `Hit` report.
+- Requires `v == 5` (see the migration note below).
 - Requires every fixed-point field to be within the range in the units table.
 - Rate limits accepted input to at most one update per 25 ms per connection.
+- Echoes a `Ping` (tag `1`) back as a `pong`, rate limited to one echo per 25 ms per connection.
 - Rejects non-monotonic `sequence` values per player.
 
 Client-side (`handleEvent`, `decodePosition`, `receiveReliable`):
 
 - Ignores unparsable MessagePack, non-array messages, and arrays of the wrong length.
 - Ignores events whose `id` is not a safe integer, and its own `id`.
-- Ignores a position array that is not exactly 12 entries or holds a non-numeric value.
+- Ignores a position array that is not exactly 13 entries or holds a non-numeric value.
+- Ignores a `pong` whose nonce does not match the probe currently in flight.
 - Ignores reliable stream frames larger than 512 bytes.
 - Drops stale/duplicate `sequence` values.
 
 ## Migration note
 
 Version 3 replaced the earlier JSON encoding outright; there is no dual-dialect path. Version 4
-appended the `fire` flag to the position array, so a v3 client encodes 11 fields while a v4 server
-expects 12. Version mismatches and short arrays are dropped by validation, which makes an out-of-date
-tab fall back to `SOLO` and retry. Deploy the server and the frontend together, then **hard-refresh
-every tab that is already open**.
+appended the `fire` flag and version 5 appended `health`, so a v4 client encodes 12 fields while a v5
+server expects 13. Version mismatches and short arrays are dropped by validation, which makes an
+out-of-date tab fall back to `SOLO` and retry. Deploy the server and the frontend together, then
+**hard-refresh every tab that is already open**. The `Ping` / `pong` probe is additive and leaves the
+`Update` shape untouched, so it needs no version bump: an older server that does not understand it
+simply never answers and the HUD leaves the latency blank.
 
 ## Tests
 
@@ -165,6 +204,30 @@ The wire format is pinned from both sides:
 
 If either test fails, the two languages have drifted apart. Changing the units table or the field
 order means updating both fixtures together.
+
+## Combat
+
+Damage is **shooter-reported but victim-applied**, which keeps the server out of physics entirely:
+
+1. Every client simulates every avatar's bullets locally for visuals. Only the shooter's own client
+   is allowed to test its rounds against other birds, and it tests them against a 1.5 m sphere around
+   each peer's interpolated position.
+2. On a hit it sends a `Hit` report naming the victim. The server relays it reliably, stamped with
+   the shooter id, to everyone.
+3. The victim applies the damage to its own `health` — it is authoritative over its own hit points —
+   then broadcasts the new value in its next position update, so peers see the shake and the wreck.
+4. A killing blow starts the death spiral locally (no control authority, gravity takes over, the
+   body tumbles). Because only positions travel, every peer sees the fall for free. Once the wreck is
+   grounded the respawn timer runs, and the owner teleports back to the spawn with full health.
+
+Consequences worth knowing:
+
+- Hits are decided by the shooter against a slightly stale view of the target (up to one update of
+  interpolation), so a near miss can register and a marginal hit can be missed.
+- There is no server-side validation of who hit whom. Any client can claim a hit on any other player
+  in the room, so this is fine for casual play but **not** suitable for competitive scoring — the
+  same caveat the README already applies to client-reported movement.
+- Bullets, muzzle flashes and impacts are never replicated, only the trigger flag and hit reports.
 
 ## Interpolation and expiry
 
@@ -182,11 +245,25 @@ Remote players are rendered smoothly rather than snapping to each received frame
   so a 20 Hz stream still looks like continuous wingbeats.
 - A player with no update for 3 seconds is removed from the local map.
 
+## Latency measurement
+
+The HUD shows round-trip time to the server, measured in the application rather than from QUIC
+internals (browsers do not expose RTT statistics):
+
+- `send()` emits `Ping` `[1, nonce]` about once per second while connected, remembering the nonce
+  and local send time of the single probe in flight.
+- The server echoes `pong` `[4, nonce]` on a datagram, rate limited to one echo per 25 ms.
+- On a matching nonce the client computes `now - sentAt` and blends it into a smoothed value
+  (weight `0.3` per sample), which the status chip renders in whole milliseconds.
+- Loss only costs one sample, since the next probe overwrites the one in flight. Disconnecting
+  clears the value, so the chip only shows it while `CONNECTED`.
+- The value is styled amber above 120 ms and red above 250 ms.
+
 ## Update rate and bandwidth
 
 Positions are sent at 20 Hz and interpolated, which is a good balance for a game of this speed:
 
-- A full `Update` is about 34 bytes, plus roughly 50 bytes of IPv6/UDP/QUIC framing per datagram.
+- A full `Update` is about 35 bytes, plus roughly 50 bytes of IPv6/UDP/QUIC framing per datagram.
   At 20 Hz that is under 2 KB/s per client — comfortably inside typical MTU, so a datagram is never
   fragmented and a lost one costs very little.
 - Server egress scales as `players × (players − 1) × rate × size`. At the 32-player cap and 20 Hz
@@ -223,7 +300,10 @@ Bumping the rate means keeping three numbers in sync: `SEND_INTERVAL_MS` in `src
 | --- | --- |
 | Client transport, wire codec, interpolation | `src/network.ts` |
 | Client usage in frame loop and reconnect timer | `src/App.vue` |
-| Remote avatar, wing and shot rendering | `src/scene.ts` |
+| Remote avatar, wing, shot and damage rendering | `src/scene.ts` |
+| Heading-up radar of nearby peers (projection + canvas) | `src/minimap.ts` |
+| Flight model, health, death spiral, respawn | `src/flight.ts` |
+| Bullet ballistics and bird hit detection | `src/weapon.ts` |
 | Wire-format fixture (client side) | `src/__tests__/network.spec.ts` |
 | Wire-format fixture (server side) | `server/src/main.rs` |
 | Dev certificate-hash proxy | `vite.config.ts` |

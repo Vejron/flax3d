@@ -3,11 +3,23 @@ import { courseRings, courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
 import type { RemoteFlight } from './network'
 import { terrainHeight } from './terrain'
-import { createGun, createWeaponRig } from './weapon'
+import { createGun, createWeaponRig, type BulletTarget } from './weapon'
+
+/** Radius of the sphere bullets test against a bird, in metres. */
+const BIRD_HIT_RADIUS = 1.5
+/** Seconds for a peer's hit shake to fade; mirrors `shakeTime` in flight.ts. */
+const REMOTE_SHAKE_TIME = 0.4
+/** Tumble rate for a bird its owner reported dead, in radians per second. */
+const DEATH_SPIN_RATE = 9
+
+export interface SceneHandlers {
+    /** Called when a round fired by this client strikes another bird, so the hit can be reported. */
+    onHit?: (victimId: number) => void
+}
 
 export { terrainHeight } from './terrain'
 
-export function createScene(container: HTMLElement) {
+export function createScene(container: HTMLElement, handlers: SceneHandlers = {}) {
     const scene = new THREE.Scene()
     scene.background = new THREE.Color('#d3e8df')
     scene.fog = new THREE.FogExp2('#d3e8df', 0.004)
@@ -140,6 +152,13 @@ export function createScene(container: HTMLElement) {
     const remoteFlyers = new Map<number, THREE.Group>()
     // Remote shots reuse the shared weapon rig, so each avatar only needs its muzzle transform.
     const remoteMuzzles = new Map<number, THREE.Object3D>()
+    /** Last health reported per peer, used to arm their hit shake. */
+    const remoteHealth = new Map<number, number>()
+    /** Decaying hit-shake intensity per peer. */
+    const remoteShake = new Map<number, number>()
+    /** Reused target objects and the per-frame view handed to the weapon; no per-frame allocation. */
+    const hitTargetPool: BulletTarget[] = []
+    const hitTargets: BulletTarget[] = []
     const remoteBadgeGeometry = new THREE.SphereGeometry(0.18, 8, 6)
     const remoteBadgeMaterial = new THREE.MeshBasicMaterial({ color: '#45dbbb' })
 
@@ -208,13 +227,34 @@ export function createScene(container: HTMLElement) {
     resize()
 
     let lastFlapAt = -Infinity
+    /** Rebuilds the target list from the live peer avatars; wrecks cannot be hit again. */
+    function refreshHitTargets() {
+        hitTargets.length = 0
+        for (const [id, avatar] of remoteFlyers) {
+            if ((remoteHealth.get(id) ?? 0) <= 0) continue
+            let target = hitTargetPool[hitTargets.length]
+            if (!target) {
+                target = { id, x: 0, y: 0, z: 0, radius: BIRD_HIT_RADIUS }
+                hitTargetPool.push(target)
+            }
+            target.id = id
+            target.x = avatar.position.x
+            target.y = avatar.position.y
+            target.z = avatar.position.z
+            hitTargets.push(target)
+        }
+    }
     function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = [], fire = false) {
+        const dt = Math.min(elapsed - lastCameraTime, 0.05)
+        lastCameraTime = elapsed
         const active = new Set(remotes.map((remote) => remote.id))
         for (const [id, avatar] of remoteFlyers) {
             if (!active.has(id)) {
                 scene.remove(avatar)
                 remoteFlyers.delete(id)
                 remoteMuzzles.delete(id)
+                remoteHealth.delete(id)
+                remoteShake.delete(id)
             }
         }
         for (const remote of remotes) {
@@ -229,8 +269,24 @@ export function createScene(container: HTMLElement) {
                 const avatarMuzzle = avatar.getObjectByName('muzzle')
                 if (avatarMuzzle) remoteMuzzles.set(remote.id, avatarMuzzle)
             }
-            avatar.position.set(remote.flight.x, remote.flight.y + 1.1, remote.flight.z)
-            avatar.rotation.set(0, -remote.flight.yaw, remote.flight.bank)
+            // Arm a shake when a peer's reported health drops, and tumble it while it is dead.
+            const lastHealth = remoteHealth.get(remote.id)
+            if (lastHealth !== undefined && remote.flight.health < lastHealth) remoteShake.set(remote.id, 1)
+            remoteHealth.set(remote.id, remote.flight.health)
+            const peerShake = Math.max(0, (remoteShake.get(remote.id) ?? 0) - dt / REMOTE_SHAKE_TIME)
+            remoteShake.set(remote.id, peerShake)
+            const dying = remote.flight.health <= 0
+            const peerTumble = dying ? elapsed * DEATH_SPIN_RATE : 0
+            avatar.position.set(
+                remote.flight.x + Math.sin(elapsed * 92 + remote.id) * peerShake * 0.3,
+                remote.flight.y + 1.1 + Math.cos(elapsed * 71 + remote.id) * peerShake * 0.25,
+                remote.flight.z + Math.sin(elapsed * 83 + remote.id) * peerShake * 0.3,
+            )
+            avatar.rotation.set(
+                dying ? peerTumble * 0.6 : 0,
+                -remote.flight.yaw + (dying ? peerTumble * 0.5 : 0),
+                dying ? peerTumble : remote.flight.bank,
+            )
             // Replicate a peer's shot cosmetically: every client simulates every avatar's rounds
             // locally, so no bullet state travels on the wire. The shared rig throttles this to
             // that shooter's own fire interval rather than the 20 Hz packet rate.
@@ -274,10 +330,18 @@ export function createScene(container: HTMLElement) {
         }
         head.rotation.y += ((poseHead?.yaw ?? 0) - head.rotation.y) * 0.18
         head.rotation.z += ((poseHead?.tilt ?? 0) - head.rotation.z) * 0.18
-        flyer.position.set(state.x, state.y + 1.1, state.z)
-        flyer.rotation.set(Math.sin(elapsed * 2) * 0.025, -state.yaw, state.bank)
-        const dt = Math.min(elapsed - lastCameraTime, 0.05)
-        lastCameraTime = elapsed
+        // A hit rattles the whole bird; a dying one tumbles instead of banking.
+        const tumble = state.dead ? state.spin : 0
+        flyer.position.set(
+            state.x + Math.sin(elapsed * 92) * state.shake * 0.3,
+            state.y + 1.1 + Math.cos(elapsed * 71) * state.shake * 0.25,
+            state.z + Math.sin(elapsed * 83) * state.shake * 0.3,
+        )
+        flyer.rotation.set(
+            state.dead ? tumble * 0.6 : Math.sin(elapsed * 2) * 0.025,
+            -state.yaw + (state.dead ? tumble * 0.5 : 0),
+            state.dead ? tumble : state.bank,
+        )
         const angle = Math.atan2(Math.sin(state.yaw - cameraYaw), Math.cos(state.yaw - cameraYaw))
         cameraYaw += angle * (1 - Math.exp(-2.3 * dt))
         cameraTarget.set(state.x - Math.sin(cameraYaw) * 12, state.y + 7, state.z + Math.cos(cameraYaw) * 12)
@@ -291,7 +355,8 @@ export function createScene(container: HTMLElement) {
             aimDirection.set(Math.sin(state.yaw) * cosPitch, Math.sin(pitch), -Math.cos(state.yaw) * cosPitch)
             weapon.fire(aimDirection)
         }
-        weapon.update(dt, terrainHeight)
+        refreshHitTargets()
+        for (const hit of weapon.update(dt, terrainHeight, hitTargets)) handlers.onHit?.(hit.targetId)
         for (const trail of trails) {
             if (!state.flying || state.speed < 4) {
                 trail.points.length = 0

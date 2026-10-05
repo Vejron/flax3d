@@ -75,7 +75,7 @@ For checks, run `cargo test --manifest-path server/Cargo.toml`, `cargo clippy --
 
 ## Multiplayer (VPS)
 
-Point the `A` record for `flax3d.intinor.uk` at the VPS (add `AAAA` only with working IPv6). Make TCP 80/443 and UDP 443 reachable in both provider and host firewalls. These ports must be available to Salvo: TCP 80 handles the ACME HTTP-01 challenge, TCP 443 serves the site over HTTPS, and UDP 443 carries HTTP/3 WebTransport. This deployment expects a Linux host, not a TCP-only reverse proxy in front of QUIC.
+The `A` record for `flax3d.intinor.uk` points at the VPS (add `AAAA` only with working IPv6). Make TCP 80/443 and UDP 443 reachable in both provider and host firewalls. These ports must be available to Salvo: TCP 80 handles the ACME HTTP-01 challenge, TCP 443 serves the site over HTTPS, and UDP 443 carries HTTP/3 WebTransport. This deployment expects a Linux host, not a TCP-only reverse proxy in front of QUIC.
 
 Build on the VPS (or transfer builds for its architecture), then launch from the repository root with persistent, writable ACME storage:
 
@@ -92,14 +92,14 @@ After deployment, open `https://flax3d.intinor.uk/` from another network in two 
 
 ### Docker VPS deployment
 
-Use `scripts/deploy.sh` to build the frontend and an `amd64` Docker image locally, transfer the image to the VPS, and deploy it while retaining the ACME volume. It defaults to `root@136.148.208.208`, `remote.intinor.uk`, and `/opt/flax3d`. Requirements on the development Mac are Docker Desktop, Node/npm, gzip, and SSH key access; the VPS needs Docker, curl, and UFW already allowing TCP 80/443 and UDP 443. The script checks SSH and Docker before building. It only replaces a prior container using a `flax3d:*` image, retaining the previous container under a unique rollback name. If HTTPS health checking fails, the script restores the previous container. Older rollback containers are pruned once a deploy is healthy, so at most one is retained; remove it manually after confirming the deployment is stable.
+Use `scripts/deploy.sh` to build the frontend and an `amd64` Docker image locally, transfer the image to the VPS, and deploy it while retaining the ACME volume. It defaults to `root@136.148.208.208`, `flax3d.intinor.uk`, and `/opt/flax3d`. Requirements on the development Mac are Docker Desktop, Node/npm, gzip, and SSH key access; the VPS needs Docker, curl, and UFW already allowing TCP 80/443 and UDP 443. The script checks SSH and Docker before building. It only replaces a prior container using a `flax3d:*` image, retaining the previous container under a unique rollback name. If HTTPS health checking fails, the script restores the previous container. Older rollback containers are pruned once a deploy is healthy, so at most one is retained; remove it manually after confirming the deployment is stable.
 
 ```sh
 chmod +x scripts/deploy.sh
 ./scripts/deploy.sh
 ```
 
-Override defaults through environment variables, for example `DEPLOY_DOMAIN=flax3d.intinor.uk ./scripts/deploy.sh` after adding that DNS record. `DEPLOY_HOST`, `DEPLOY_REMOTE_DIR`, `DEPLOY_PLATFORM`, `DEPLOY_HEALTH_TIMEOUT`, and `DEPLOY_CARGO_JOBS` are also supported. The script does not configure DNS or firewall rules.
+Override defaults through environment variables, for example `DEPLOY_HOST=root@10.0.0.1 ./scripts/deploy.sh`. `DEPLOY_DOMAIN`, `DEPLOY_REMOTE_DIR`, `DEPLOY_PLATFORM`, `DEPLOY_HEALTH_TIMEOUT`, and `DEPLOY_CARGO_JOBS` are also supported. The script does not configure DNS or firewall rules.
 
 Dependencies are compiled in their own Docker layer, so a source-only change rebuilds just the server crate rather than the whole dependency graph. `DEPLOY_CARGO_JOBS` (default 4) controls rustc parallelism for cold builds. Only one rollback container is kept: after a successful deploy, older `flax3d-rollback-*` containers are removed.
 

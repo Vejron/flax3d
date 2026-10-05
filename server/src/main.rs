@@ -22,7 +22,11 @@ use tokio::sync::broadcast;
 const MAX_PLAYERS: usize = 32;
 const MAX_PACKET: usize = 512;
 /// Wire schema version, mirrored by `MESSAGE_VERSION` in `src/network.ts`.
-const MESSAGE_VERSION: u8 = 4;
+const MESSAGE_VERSION: u8 = 5;
+/// Tag for a client's hit report (`[0, victimId]`), which cannot be confused with an update.
+const MESSAGE_HIT: u8 = 0;
+/// Tag for a client's latency probe (`[1, nonce]`), which the server echoes back as a `pong`.
+const MESSAGE_PING: u8 = 1;
 
 /// Fixed-point wire position. Units mirror `src/network.ts` and are documented in NETWORKING.md.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -46,6 +50,8 @@ struct Position {
     wing_right: i16,
     /// True while the sender is holding the trigger. Relayed so peers can play a cosmetic shot.
     fire: bool,
+    /// Hit points in `0..=100`. Owned by the sender's client; the server only relays it.
+    health: u8,
 }
 
 impl Position {
@@ -59,6 +65,7 @@ impl Position {
             && self.spread <= 1_000
             && self.wing_left.abs() <= 2_000
             && self.wing_right.abs() <= 2_000
+            && self.health <= 100
     }
 }
 
@@ -77,11 +84,13 @@ impl Default for Position {
             wing_left: 0,
             wing_right: 0,
             fire: false,
+            health: 100,
         }
     }
 }
 
-/// Client update: `[version, sequence, position]` as a MessagePack array.
+/// Client update: `[version, sequence, position]` as a MessagePack array. A hit report is
+/// `[MESSAGE_HIT, victim]`; the two shapes are disjoint, so decoding tries the update first.
 #[derive(Deserialize)]
 struct Update(u8, u32, Position);
 
@@ -91,6 +100,8 @@ struct Event {
     id: u64,
     sequence: u32,
     position: Position,
+    /// Victim of a `Hit` event; unused by the other kinds.
+    victim: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -98,25 +109,33 @@ enum EventKind {
     Welcome,
     State,
     Leave,
+    Hit,
 }
 
 impl Event {
     fn welcome(id: u64) -> Self {
-        Self { kind: EventKind::Welcome, id, sequence: 0, position: Position::default() }
+        Self { kind: EventKind::Welcome, id, sequence: 0, position: Position::default(), victim: 0 }
     }
 
     fn state(id: u64, sequence: u32, position: Position) -> Self {
-        Self { kind: EventKind::State, id, sequence, position }
+        Self { kind: EventKind::State, id, sequence, position, victim: 0 }
     }
 
     fn leave(id: u64) -> Self {
-        Self { kind: EventKind::Leave, id, sequence: 0, position: Position::default() }
+        Self { kind: EventKind::Leave, id, sequence: 0, position: Position::default(), victim: 0 }
+    }
+
+    /// `id` is the shooter, `victim` the player it claims to have hit.
+    fn hit(id: u64, victim: u64) -> Self {
+        Self { kind: EventKind::Hit, id, sequence: 0, position: Position::default(), victim }
     }
 }
 
 const EVENT_WELCOME: u8 = 0;
 const EVENT_STATE: u8 = 1;
 const EVENT_LEAVE: u8 = 2;
+const EVENT_HIT: u8 = 3;
+const EVENT_PONG: u8 = 4;
 
 fn event_bytes(event: &Event) -> Result<Bytes, salvo::Error> {
     let bytes = match event.kind {
@@ -125,6 +144,7 @@ fn event_bytes(event: &Event) -> Result<Bytes, salvo::Error> {
             rmp_serde::to_vec(&(EVENT_STATE, event.id, event.sequence, &event.position))
         }
         EventKind::Leave => rmp_serde::to_vec(&(EVENT_LEAVE, event.id)),
+        EventKind::Hit => rmp_serde::to_vec(&(EVENT_HIT, event.id, event.victim)),
     }
     .map_err(salvo::Error::other)?;
     Ok(Bytes::from(bytes))
@@ -258,28 +278,50 @@ impl Relay {
             stream.shutdown().await?;
         }
         let mut last_update = Instant::now() - StdDuration::from_secs(1);
+        let mut last_hit = Instant::now() - StdDuration::from_secs(1);
+        let mut last_ping = Instant::now() - StdDuration::from_secs(1);
         loop {
             tokio::select! {
                 incoming = reader.read_datagram() => {
                     let Ok(datagram) = incoming else { break };
                     let payload = datagram.into_payload();
-                    if payload.len() > MAX_PACKET || last_update.elapsed() < StdDuration::from_millis(25) { continue; }
-                    let Ok(update) = rmp_serde::from_slice::<Update>(&payload) else { continue };
-                    if update.0 != MESSAGE_VERSION || !update.2.valid() { continue; }
-                    {
-                        let mut players = room.players.lock().unwrap();
-                        let Some(player) = players.get_mut(&id) else { break };
-                        if update.1 <= player.sequence { continue; }
-                        player.sequence = update.1;
-                        player.position = update.2.clone();
+                    if payload.len() > MAX_PACKET { continue; }
+                    if let Ok(update) = rmp_serde::from_slice::<Update>(&payload) {
+                        if last_update.elapsed() < StdDuration::from_millis(25) { continue; }
+                        if update.0 != MESSAGE_VERSION || !update.2.valid() { continue; }
+                        {
+                            let mut players = room.players.lock().unwrap();
+                            let Some(player) = players.get_mut(&id) else { break };
+                            if update.1 <= player.sequence { continue; }
+                            player.sequence = update.1;
+                            player.position = update.2.clone();
+                        }
+                        last_update = Instant::now();
+                        let _ = room.events.send(Event::state(id, update.1, update.2));
+                    } else if let Ok((tag, value)) = rmp_serde::from_slice::<(u8, u64)>(&payload) {
+                        // Both control messages are two-element `[tag, value]` arrays, so they share
+                        // a decode and are told apart by tag. Each gets its own throttle rather than
+                        // sharing the 20 Hz update budget.
+                        if tag == MESSAGE_HIT {
+                            // The victim must still be in the room.
+                            if last_hit.elapsed() < StdDuration::from_millis(25) { continue; }
+                            if value == id || !room.players.lock().unwrap().contains_key(&value) { continue; }
+                            last_hit = Instant::now();
+                            let _ = room.events.send(Event::hit(id, value));
+                        } else if tag == MESSAGE_PING {
+                            // Latency probe: echo the nonce straight back on a datagram. No timing
+                            // is kept server-side, so the client measures the whole round trip.
+                            if last_ping.elapsed() < StdDuration::from_millis(25) { continue; }
+                            last_ping = Instant::now();
+                            let pong = rmp_serde::to_vec(&(EVENT_PONG, value)).map_err(salvo::Error::other)?;
+                            if sender.send_datagram(Bytes::from(pong)).is_err() { break; }
+                        }
                     }
-                    last_update = Instant::now();
-                    let _ = room.events.send(Event::state(id, update.1, update.2));
                 }
                 outgoing = events.recv() => {
                     match outgoing {
                         Ok(event) => {
-                            if event.id == id && matches!(event.kind, EventKind::State) { continue; }
+                            if event.id == id && matches!(event.kind, EventKind::State | EventKind::Hit) { continue; }
                             if matches!(event.kind, EventKind::State) {
                                 if sender.send_datagram(event_bytes(&event)?).is_err() { break; }
                             } else {
@@ -382,6 +424,7 @@ mod tests {
         assert!(!Position { spread: 1_001, ..position() }.valid());
         assert!(!Position { wing_left: -2_001, ..position() }.valid());
         assert!(!Position { wing_right: 2_001, ..position() }.valid());
+        assert!(!Position { health: 101, ..position() }.valid());
     }
 
     /// Byte-for-byte fixture emitted by `encodeUpdate` in `src/network.ts`. If this breaks, the two
@@ -389,8 +432,8 @@ mod tests {
     #[test]
     fn decodes_a_client_update_fixture() {
         let fixture: &[u8] = &[
-            147, 4, 7, 156, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
-            5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 195,
+            147, 5, 7, 157, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
+            5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 195, 100,
         ];
         let Update(version, sequence, position) = rmp_serde::from_slice(fixture).unwrap();
         assert_eq!(version, MESSAGE_VERSION);
@@ -410,6 +453,7 @@ mod tests {
                 wing_left: -250,
                 wing_right: 850,
                 fire: true,
+                health: 100,
             }
         );
         assert!(position.valid());
@@ -429,6 +473,37 @@ mod tests {
         assert_eq!((kind, id, sequence), (EVENT_STATE, 9, 3));
         assert_eq!(decoded, position());
         assert!(state.len() < 64);
+    }
+
+    #[test]
+    fn encodes_hit_events_with_the_shooter_stamped() {
+        let bytes = event_bytes(&Event::hit(4, 9)).unwrap();
+        let (kind, shooter, victim) = rmp_serde::from_slice::<(u8, u64, u64)>(&bytes).unwrap();
+        assert_eq!((kind, shooter, victim), (EVENT_HIT, 4, 9));
+        assert!(bytes.len() < 32);
+    }
+
+    #[test]
+    fn echoes_a_ping_as_a_pong_with_the_same_nonce() {
+        let pong = rmp_serde::to_vec(&(EVENT_PONG, 7u64)).unwrap();
+        assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&pong).unwrap(), (EVENT_PONG, 7));
+        assert!(pong.len() < 16);
+    }
+
+    #[test]
+    fn hit_reports_and_position_updates_decode_apart() {
+        let hit = rmp_serde::to_vec(&(MESSAGE_HIT, 9u64)).unwrap();
+        assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&hit).unwrap(), (MESSAGE_HIT, 9));
+        assert!(rmp_serde::from_slice::<Update>(&hit).is_err());
+
+        // A ping is the same two-field shape as a hit, told apart only by the tag.
+        let ping = rmp_serde::to_vec(&(MESSAGE_PING, 3u64)).unwrap();
+        assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&ping).unwrap(), (MESSAGE_PING, 3));
+        assert!(rmp_serde::from_slice::<Update>(&ping).is_err());
+
+        let update = rmp_serde::to_vec(&(MESSAGE_VERSION, 1u32, Position::default())).unwrap();
+        assert!(rmp_serde::from_slice::<Update>(&update).is_ok());
+        assert!(rmp_serde::from_slice::<(u8, u64)>(&update).is_err());
     }
 
     #[test]

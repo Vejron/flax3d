@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Camera, CameraOff, Crosshair, MoveUp, RotateCcw, SlidersHorizontal, Wind, X } from 'lucide-vue-next'
+import { Camera, CameraOff, Crosshair, Keyboard, MoveUp, RotateCcw, SlidersHorizontal, Wind, X } from 'lucide-vue-next'
 import type { Pose, PoseDetector } from '@tensorflow-models/pose-detection'
 import { advanceCourse, courseRings, courseSpawn, type CourseProgress } from './course'
-import { flightConfig, initialFlightState, stepFlight, type FlightConfig, type FlightControls } from './flight'
+import { applyHit, flightConfig, initialFlightState, respawnFlight, stepFlight, type FlightConfig, type FlightControls } from './flight'
+import { createMinimap } from './minimap'
 import { FlightNetwork } from './network'
 import { PoseControls } from './poseControls'
 import { createScene, terrainHeight } from './scene'
@@ -11,15 +12,19 @@ import { createScene, terrainHeight } from './scene'
 const viewport = ref<HTMLElement | null>(null)
 const video = ref<HTMLVideoElement | null>(null)
 const skeleton = ref<HTMLCanvasElement | null>(null)
+const radar = ref<HTMLCanvasElement | null>(null)
 const flight = ref({ ...initialFlightState(terrainHeight(courseSpawn.x, courseSpawn.z)), ...courseSpawn })
 const course = ref<CourseProgress>({ nextRing: 0, laps: 0 })
 const cameraStatus = ref<'off' | 'loading' | 'tracking' | 'lost'>('off')
 const error = ref('')
 const networkStatus = ref('SOLO')
 const nearbyPlayers = ref(0)
+const latencyMs = ref<number | null>(null)
 const controls = ref<FlightControls>({ flap: false, steer: 0, spread: 1 })
 const liftOutput = ref(0)
 const settingsOpen = ref(false)
+// Hidden by default so the sky stays clear; the header "Flight controls" button toggles it.
+const instructionsOpen = ref(false)
 const tuning = reactive<FlightConfig>({ ...flightConfig })
 type TuningField = { key: keyof FlightConfig; label: string; min: number; max: number; step: number }
 const settingGroups: { title: string; fields: TuningField[] }[] = [
@@ -70,11 +75,20 @@ const settingGroups: { title: string; fields: TuningField[] }[] = [
       { key: 'maxTimeStep', label: 'Time step cap', min: 0.01, max: 0.1, step: 0.005 },
     ]
   },
+  {
+    title: 'Combat', fields: [
+      { key: 'maxHealth', label: 'Max health', min: 25, max: 200, step: 5 },
+      { key: 'damagePerHit', label: 'Damage per hit', min: 5, max: 100, step: 5 },
+      { key: 'respawnDelay', label: 'Respawn delay', min: 0.5, max: 8, step: 0.5 },
+    ]
+  },
 ]
 const wingPose = ref<{ leftWing: number; rightWing: number } | null>(null)
 const headPose = ref<{ yaw: number; tilt: number } | null>(null)
 const seconds = ref(0)
-const mode = computed(() => flight.value.flying ? 'IN FLIGHT' : 'ON THE GROUND')
+const mode = computed(() => flight.value.dead ? 'ELIMINATED' : flight.value.flying ? 'IN FLIGHT' : 'ON THE GROUND')
+const healthPercent = computed(() => Math.max(0, Math.min(100, (flight.value.health / tuning.maxHealth) * 100)))
+const latencyClass = computed(() => latencyMs.value === null ? '' : latencyMs.value > 250 ? 'latency-bad' : latencyMs.value > 120 ? 'latency-warn' : '')
 const altitude = computed(() => Math.max(0, flight.value.y - terrainHeight(flight.value.x, flight.value.z)))
 const poseControls = new PoseControls()
 const keys = new Set<string>()
@@ -89,6 +103,7 @@ let renderFrame = 0
 let poseFrame = 0
 let lastFrame = 0
 let scene: ReturnType<typeof createScene> | null = null
+let minimap: ReturnType<typeof createMinimap> | null = null
 let running = false
 let network: FlightNetwork | null = null
 let reconnectTimer = 0
@@ -187,11 +202,23 @@ function frame(now: number) {
   const firing = keys.has('KeyF') || fireQueued || pointerFiring
   fireQueued = false
   const previousFlight = flight.value
-  flight.value = stepFlight(previousFlight, input, dt, terrainHeight, tuning)
-  course.value = advanceCourse(course.value, previousFlight, flight.value)
+  let next = stepFlight(previousFlight, input, dt, terrainHeight, tuning)
+  // Hits are reported by shooters, but the victim owns its own health, so damage is applied here.
+  const incoming = network?.takeDamage() ?? 0
+  if (incoming > 0) next = applyHit(next, incoming * tuning.damagePerHit, tuning)
+  let respawned = false
+  if (next.dead && next.respawn <= 0) {
+    next = respawnFlight(terrainHeight(courseSpawn.x, courseSpawn.z), courseSpawn)
+    respawned = true
+  }
+  flight.value = next
+  course.value = respawned ? { nextRing: 0, laps: course.value.laps } : advanceCourse(course.value, previousFlight, next)
   liftOutput.value += ((input.flap ? 1 : Math.min(1, (input.flapPower ?? 0) / tuning.maxWingPower)) - liftOutput.value) * Math.min(1, dt * 12)
   const remotes = network?.remotes(now) ?? []
   nearbyPlayers.value = remotes.length
+  const rtt = network?.latencyMs ?? null
+  if (rtt !== latencyMs.value) latencyMs.value = rtt
+  minimap?.draw(flight.value, remotes)
   const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes, firing)
   network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now, firing)
   renderFrame = requestAnimationFrame(frame)
@@ -267,7 +294,8 @@ function stopCamera() {
 function calibrate() { if (latestPose) poseControls.calibrate(latestPose) }
 
 onMounted(() => {
-  if (viewport.value) scene = createScene(viewport.value)
+  if (viewport.value) scene = createScene(viewport.value, { onHit: (victimId) => network?.reportHit(victimId) })
+  if (radar.value) minimap = createMinimap(radar.value)
   running = true
   renderFrame = requestAnimationFrame(frame)
   window.addEventListener('keydown', keyDown)
@@ -283,6 +311,8 @@ onBeforeUnmount(() => {
   network?.close()
   cancelAnimationFrame(renderFrame)
   stopCamera()
+  minimap?.dispose()
+  minimap = null
   scene?.dispose()
   window.removeEventListener('keydown', keyDown)
   window.removeEventListener('keyup', keyUp)
@@ -299,9 +329,20 @@ onBeforeUnmount(() => {
       <div class="brand"><span class="brand-mark">F<span>·</span></span><span>FLAX <small>FLIGHT LAB</small></span>
       </div>
       <div class="flight-status"><span class="status-light" :class="{ active: flight.flying }" />{{ mode }} · {{
-        networkStatus === 'CONNECTED' ? `${nearbyPlayers + 1} ONLINE` : networkStatus }}</div>
+        networkStatus === 'CONNECTED' ? `${nearbyPlayers + 1} ONLINE · ` : networkStatus }}<span
+          v-if="networkStatus === 'CONNECTED'" class="latency" :class="latencyClass">{{ latencyMs ?? '--' }} ms</span>
+      </div>
       <div class="top-actions">
+        <div class="top-readout health-readout" :class="{ low: healthPercent <= 30 }">
+          <span>{{ flight.dead ? 'RESPAWN' : 'INTEGRITY' }}</span>
+          <strong>{{ flight.dead ? flight.respawn.toFixed(1) : Math.round(flight.health) }}<small>{{ flight.dead ? 's' :
+            '%' }}</small></strong>
+        </div>
         <div class="top-readout"><span>ALTITUDE</span><strong>{{ altitude.toFixed(1) }} <small>m</small></strong></div>
+        <button class="settings-toggle" type="button" title="Flight controls" aria-label="Flight controls"
+          :aria-expanded="instructionsOpen" @click="instructionsOpen = !instructionsOpen">
+          <Keyboard :size="19" />
+        </button>
         <button class="settings-toggle" type="button" title="Flight settings" aria-label="Flight settings"
           :aria-expanded="settingsOpen" @click="settingsOpen = !settingsOpen">
           <SlidersHorizontal :size="19" />
@@ -309,11 +350,24 @@ onBeforeUnmount(() => {
       </div>
     </header>
     <div class="horizon-label" aria-hidden="true"><span>▲</span> OPEN SKY</div>
+    <section v-show="!settingsOpen" class="radar-panel" aria-label="Player radar">
+      <div class="radar-head">
+        <span>RADAR</span>
+        <strong>{{ nearbyPlayers }}<small>{{ nearbyPlayers === 1 ? 'CONTACT' : 'CONTACTS' }}</small></strong>
+      </div>
+      <canvas ref="radar" class="radar-scope" role="img"
+        :aria-label="`Radar: ${nearbyPlayers} nearby player${nearbyPlayers === 1 ? '' : 's'}`" />
+      <div class="radar-legend">
+        <span><i class="radar-dot level" />LEVEL</span>
+        <span><i class="radar-dot above" />ABOVE</span>
+        <span><i class="radar-dot below" />BELOW</span>
+      </div>
+    </section>
     <section class="dashboard" aria-label="Flight instruments">
       <div class="metric"><span>01 / AIRSPEED</span><strong>{{ Math.round(flight.speed * 3.6) }}<small>
             km/h</small></strong></div>
       <div class="metric"><span>02 / HEADING</span><strong>{{ ((flight.yaw * 180 / Math.PI + 360) % 360).toFixed(0)
-      }}<small>°</small></strong></div>
+          }}<small>°</small></strong></div>
       <div class="metric course-metric"><span>03 / COURSE</span><strong>{{ courseRings[course.nextRing]?.kind ===
         'checkpoint' ?
         `${course.nextRing} / ${courseRings.length - 2}` : courseRings[course.nextRing]?.kind?.toUpperCase() }}<small>
@@ -324,6 +378,14 @@ onBeforeUnmount(() => {
           <div :style="{ width: `${(flight.flying ? liftOutput : flight.charge / tuning.takeoffCharge) * 100}%` }" />
         </div>
         <small>{{ flight.flying ? 'KEEP YOUR WINGS WIDE TO GLIDE' : 'FLAP TO TAKE OFF' }}</small>
+      </div>
+      <div class="charge integrity" :class="{ low: healthPercent <= 30 }">
+        <span>{{ flight.dead ? `RESPAWN IN ${flight.respawn.toFixed(1)}s` : 'INTEGRITY' }}</span>
+        <div class="charge-track">
+          <div :style="{ width: `${healthPercent}%` }" />
+        </div>
+        <small>{{ flight.dead ? 'REBUILDING AIRFRAME' : flight.health < tuning.maxHealth ? 'TAKING FIRE — BREAK OFF'
+          : 'AIRFRAME INTACT' }}</small>
       </div>
     </section>
     <div class="bottom-area">
@@ -357,10 +419,10 @@ onBeforeUnmount(() => {
         </div>
         <p v-if="error" class="error" role="alert">{{ error }}</p>
       </section>
-      <section class="instruction-panel" aria-label="Flight controls">
+      <section v-if="instructionsOpen" class="instruction-panel" aria-label="Flight controls">
         <div class="instruction-heading">
           <Wind :size="18" /> <span>{{ cameraStatus === 'tracking' ? 'FLY WITH YOUR BODY' : 'FLY WITH YOUR KEYBOARD'
-          }}</span>
+            }}</span>
         </div>
         <div class="instructions" v-if="cameraStatus === 'tracking'">
           <div><span>01</span> Raise & lower both arms <strong>FLAP</strong></div>
@@ -514,6 +576,14 @@ button:disabled {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 1.2px;
+}
+
+.latency-warn {
+  color: #efb669;
+}
+
+.latency-bad {
+  color: #ffb9a5;
 }
 
 .top-actions {
@@ -711,6 +781,85 @@ button:disabled {
   font-size: 15px;
 }
 
+.radar-panel {
+  position: absolute;
+  z-index: 4;
+  top: 100px;
+  right: 34px;
+  width: 208px;
+  padding: 11px 12px 10px;
+  background: #16382ee0;
+  border: 1px solid #d9f1dc55;
+  backdrop-filter: blur(12px);
+  user-select: none;
+}
+
+.radar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+
+.radar-head>span {
+  color: #b6d6be;
+  font: 700 10px 'DM Sans', sans-serif;
+  letter-spacing: 1.5px;
+}
+
+.radar-head strong {
+  font: 600 17px 'Space Grotesk', sans-serif;
+}
+
+.radar-head small {
+  margin-left: 5px;
+  color: #b6d6be;
+  font: 700 8px 'DM Sans', sans-serif;
+  letter-spacing: .8px;
+}
+
+.radar-scope {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+}
+
+.radar-legend {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  padding-top: 8px;
+  color: #c9e0ca;
+  font: 700 8px 'DM Sans', sans-serif;
+  letter-spacing: .8px;
+}
+
+.radar-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.radar-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.radar-dot.level {
+  background: #8de3b0;
+}
+
+.radar-dot.above {
+  background: #f0c16a;
+}
+
+.radar-dot.below {
+  background: #8fd0e8;
+}
+
 .dashboard {
   position: absolute;
   left: 34px;
@@ -746,6 +895,23 @@ button:disabled {
 .charge {
   border-top: 1px solid #ffffff44;
   padding-top: 17px;
+}
+
+.integrity {
+  margin-top: 17px;
+}
+
+.integrity .charge-track>div {
+  background: #7fd6a0;
+}
+
+.integrity.low .charge-track>div {
+  background: #d9614a;
+}
+
+/* Narrow layouts have no room for the extra dashboard block, so health moves to the top bar. */
+.health-readout {
+  display: none;
 }
 
 .charge-track {
@@ -1051,7 +1217,16 @@ button:focus-visible {
   }
 
   .top-readout {
-    min-width: 82px;
+    min-width: 66px;
+  }
+
+  .top-readout strong {
+    font-size: 20px;
+  }
+
+  .top-readout span {
+    font-size: 8px;
+    letter-spacing: 1px;
   }
 
   .top-actions {
@@ -1080,6 +1255,39 @@ button:focus-visible {
     left: 16px;
     width: 133px;
     padding: 12px;
+  }
+
+  .radar-panel {
+    top: 60px;
+    right: 10px;
+    width: 126px;
+    padding: 7px;
+  }
+
+  .radar-head {
+    padding-bottom: 5px;
+  }
+
+  .radar-head small {
+    display: none;
+  }
+
+  .radar-legend {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    padding-top: 5px;
+  }
+
+  .health-readout {
+    display: block;
+  }
+
+  .health-readout.low strong {
+    color: #ffb9a5;
+  }
+
+  .integrity {
+    display: none;
   }
 
   .metric {

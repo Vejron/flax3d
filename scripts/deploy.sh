@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 deploy_host="${DEPLOY_HOST:-root@136.148.208.208}"
-domain="${DEPLOY_DOMAIN:-remote.intinor.uk}"
+domain="${DEPLOY_DOMAIN:-flax3d.intinor.uk}"
 remote_dir="${DEPLOY_REMOTE_DIR:-/opt/flax3d}"
 platform="${DEPLOY_PLATFORM:-linux/amd64}"
 health_timeout="${DEPLOY_HEALTH_TIMEOUT:-180}"

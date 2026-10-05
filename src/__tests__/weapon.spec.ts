@@ -146,4 +146,40 @@ describe('weapon ballistics', () => {
 
         gun.dispose()
     })
+
+    it('detects a bird in flight before the ground behind it', () => {
+        const target = { id: 3, x: 0, y: 0, z: -30, radius: 1.5 }
+        let bullet = createBullet({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: -1 })
+        let hit = null
+        for (let step = 0; step < 40 && !hit; step++) {
+            const result = stepBullet(bullet, 0.05, () => -500, weaponConfig, [target])
+            bullet = result.bullet
+            hit = result.hit
+        }
+        expect(hit).not.toBeNull()
+        expect(hit!.targetId).toBe(3)
+        // Sparks spray back toward the shooter.
+        expect(hit!.normal.z).toBeGreaterThan(0.9)
+    })
+
+    it('only lets the local shooter wound a bird', () => {
+        const scene = new THREE.Scene()
+        const muzzle = new THREE.Object3D()
+        scene.add(muzzle)
+        muzzle.updateMatrixWorld(true)
+        const rig = createWeaponRig(scene, muzzle)
+        const aim = new THREE.Vector3(0, 0, -1)
+        const target = { id: 5, x: 0, y: 0, z: -20, radius: 1.5 }
+
+        expect(rig.fire(aim)).toBe(true)
+        const local = rig.update(0.2, () => -100, [target])
+        expect(local).toHaveLength(1)
+        expect(local[0]!.targetId).toBe(5)
+
+        // A peer's round is only decorative here, so it must not wound anyone on this client.
+        expect(rig.fire(aim, muzzle.position, 7)).toBe(true)
+        expect(rig.update(0.2, () => -100, [target])).toHaveLength(0)
+
+        rig.dispose()
+    })
 })

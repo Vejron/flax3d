@@ -6,6 +6,7 @@ Flax3D is a flying simulator built around tensorflow js and movenet for real-tim
 - Real-time pose estimation using Movenet
 - Interactive flying simulation
 - Built with TensorFlow.js for browser-based performance
+- Heading-up radar showing nearby multiplayer pilots, coloured by relative altitude
 
 ## Usage
 Use your body movements to control the flying simulator. Ensure your webcam is enabled for pose detection.

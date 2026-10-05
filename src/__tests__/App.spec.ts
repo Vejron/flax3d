@@ -4,7 +4,7 @@ import { mount } from '@vue/test-utils'
 import type { Pose } from '@tensorflow-models/pose-detection'
 import App from '../App.vue'
 import { advanceCourse, courseRings, courseSpawn } from '../course'
-import { flightConfig, initialFlightState, stepFlight } from '../flight'
+import { flightConfig, initialFlightState, applyHit, respawnFlight, stepFlight } from '../flight'
 import { PoseControls } from '../poseControls'
 import { terrainHeight as rollingTerrainHeight } from '../terrain'
 
@@ -20,6 +20,17 @@ describe('App', () => {
     const wrapper = mount(App)
     expect(wrapper.text()).toContain('FLIGHT LAB')
     expect(wrapper.text()).toContain('START CAMERA')
+    wrapper.unmount()
+  })
+
+  it('hides the flight controls panel by default and toggles it on demand', async () => {
+    const wrapper = mount(App)
+    expect(wrapper.find('.instruction-panel').exists()).toBe(false)
+    const toggle = wrapper.get('button[aria-label="Flight controls"]')
+    await toggle.trigger('click')
+    expect(wrapper.find('.instruction-panel').exists()).toBe(true)
+    await toggle.trigger('click')
+    expect(wrapper.find('.instruction-panel').exists()).toBe(false)
     wrapper.unmount()
   })
 
@@ -248,6 +259,54 @@ describe('flight', () => {
     expect(tuned.speed).toBeLessThan(standard.speed)
     expect(moreLift.verticalSpeed).toBeGreaterThan(standard.verticalSpeed)
     expect(flightConfig.maxSpeed).toBe(24)
+  })
+})
+
+describe('combat', () => {
+  const flatGround = () => 0
+
+  it('loses health per hit and dies on the killing blow', () => {
+    let state = applyHit(initialFlightState(0), flightConfig.damagePerHit)
+    expect(state.health).toBe(flightConfig.maxHealth - flightConfig.damagePerHit)
+    expect(state.shake).toBe(1)
+    expect(state.dead).toBe(false)
+
+    state = applyHit(state, flightConfig.damagePerHit * 3)
+    expect(state.dead).toBe(true)
+    expect(state.flying).toBe(false)
+    expect(state.respawn).toBe(flightConfig.respawnDelay)
+
+    // A wreck cannot be damaged further, and non-positive damage is ignored.
+    expect(applyHit(state, 50)).toBe(state)
+    expect(applyHit(initialFlightState(0), 0).health).toBe(flightConfig.maxHealth)
+  })
+
+  it('spins and falls with no control authority, then respawns after landing', () => {
+    const airborne = { ...initialFlightState(0), flying: true, y: 40, speed: 12 }
+    let state = applyHit(airborne, flightConfig.maxHealth)
+    state = stepFlight(state, { flap: true, steer: 1, spread: 1 }, 0.05, flatGround)
+    expect(state.y).toBeLessThan(airborne.y)
+    expect(state.spin).toBeGreaterThan(0)
+    expect(state.speed).toBeLessThan(airborne.speed)
+    expect(state.respawn).toBe(flightConfig.respawnDelay)
+
+    let frames = 0
+    while (state.respawn > 0 && frames < 400) {
+      state = stepFlight(state, { flap: false, steer: 0, spread: 1 }, 0.05, flatGround)
+      frames++
+    }
+    expect(state.respawn).toBe(0)
+    expect(state.y).toBe(0)
+    expect(frames).toBeGreaterThan(20)
+  })
+
+  it('respawns repaired at the spawn point', () => {
+    const fresh = respawnFlight(0, { x: 4, z: -6, yaw: 1.2 })
+    expect(fresh.health).toBe(flightConfig.maxHealth)
+    expect(fresh.dead).toBe(false)
+    expect(fresh.shake).toBe(0)
+    expect(fresh.spin).toBe(0)
+    expect([fresh.x, fresh.z, fresh.yaw]).toEqual([4, -6, 1.2])
   })
 })
 

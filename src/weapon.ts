@@ -14,6 +14,8 @@ export interface Bullet {
     position: Vec3
     velocity: Vec3
     age: number
+    /** Network id of the shooter. Only the local shooter's rounds can damage other birds. */
+    owner: number
 }
 
 export const weaponConfig = {
@@ -56,14 +58,29 @@ export interface BulletImpact {
     speed: number
 }
 
+/** A bird that bullets owned by the local shooter can hit. */
+export interface BulletTarget {
+    id: number
+    x: number
+    y: number
+    z: number
+    radius: number
+}
+
+/** A round that struck a bird; the shooter reports it so the victim can apply the damage. */
+export interface BulletHit extends BulletImpact {
+    targetId: number
+}
+
 export interface BulletStep {
     bullet: Bullet
     impact: BulletImpact | null
+    hit: BulletHit | null
     dead: boolean
 }
 
 /** Builds a bullet travelling at the configured muzzle speed along `direction`. */
-export function createBullet(origin: Vec3, direction: Vec3, config: WeaponConfig = weaponConfig): Bullet {
+export function createBullet(origin: Vec3, direction: Vec3, config: WeaponConfig = weaponConfig, owner = 0): Bullet {
     const length = Math.hypot(direction.x, direction.y, direction.z) || 1
     return {
         position: { ...origin },
@@ -73,6 +90,7 @@ export function createBullet(origin: Vec3, direction: Vec3, config: WeaponConfig
             z: (direction.z / length) * config.speed,
         },
         age: 0,
+        owner,
     }
 }
 
@@ -108,14 +126,15 @@ export function terrainNormal(x: number, z: number, terrainHeight: (x: number, z
 
 /**
  * Advances one bullet with gravity and walks the travelled segment in small
- * samples so a fast round cannot tunnel through a hill. Returns the new state,
- * any terrain impact, and whether the bullet should be recycled.
+ * samples so a fast round cannot tunnel through a hill or a bird. Returns the
+ * new state, any terrain impact, any bird hit, and whether it should be recycled.
  */
 export function stepBullet(
     bullet: Bullet,
     seconds: number,
     terrainHeight: (x: number, z: number) => number,
     config: WeaponConfig = weaponConfig,
+    targets?: BulletTarget[],
 ): BulletStep {
     const age = bullet.age + Math.max(0, seconds)
     const velocity = { ...bullet.velocity }
@@ -125,12 +144,36 @@ export function stepBullet(
     const step = Math.max(0, seconds) / steps
     const position = { ...bullet.position }
     let impact: BulletImpact | null = null
+    let hit: BulletHit | null = null
 
     for (let index = 0; index < steps; index++) {
         const next = {
             x: position.x + velocity.x * step,
             y: position.y + velocity.y * step,
             z: position.z + velocity.z * step,
+        }
+        const speed = Math.hypot(velocity.x, velocity.y, velocity.z)
+        if (targets) {
+            for (const target of targets) {
+                const dx = next.x - target.x
+                const dy = next.y - target.y
+                const dz = next.z - target.z
+                if (dx * dx + dy * dy + dz * dz > target.radius * target.radius) continue
+                const inverse = 1 / (speed || 1)
+                hit = {
+                    targetId: target.id,
+                    position: { ...next },
+                    // Sparks spray back toward the shooter.
+                    normal: { x: -velocity.x * inverse, y: -velocity.y * inverse, z: -velocity.z * inverse },
+                    velocity: { ...velocity },
+                    speed,
+                }
+                position.x = next.x
+                position.y = next.y
+                position.z = next.z
+                break
+            }
+            if (hit) break
         }
         const ground = terrainHeight(next.x, next.z)
         if (next.y <= ground) {
@@ -160,9 +203,10 @@ export function stepBullet(
     }
 
     return {
-        bullet: { position, velocity, age },
+        bullet: { position, velocity, age, owner: bullet.owner },
         impact,
-        dead: impact !== null || age >= config.life || position.y < config.killAltitude,
+        hit,
+        dead: impact !== null || hit !== null || age >= config.life || position.y < config.killAltitude,
     }
 }
 
@@ -236,8 +280,11 @@ export interface WeaponRig {
      * muzzle, so remote callers pass their own muzzle position and network id.
      */
     fire: (direction: THREE.Vector3, origin?: THREE.Vector3, shooter?: number) => boolean
-    /** Integrates bullets, refreshes tracers, and ages the impact effects. */
-    update: (seconds: number, terrainHeight: (x: number, z: number) => number) => void
+    /**
+     * Integrates bullets, refreshes tracers, and ages the impact effects. Only rounds owned by the
+     * local shooter test `targets`. The returned array is reused until the next call, so read it now.
+     */
+    update: (seconds: number, terrainHeight: (x: number, z: number) => number, targets?: BulletTarget[]) => BulletHit[]
     /** Releases every GPU resource the rig owns. */
     dispose: () => void
 }
@@ -257,6 +304,8 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
     const sparks: Spark[] = []
     /** Cooldown per shooter, so one player's burst never silences another's gun. */
     const cooldowns = new Map<number, number>()
+    /** Bird hits found this frame. Reused every update so the loop allocates nothing. */
+    const hits: BulletHit[] = []
     let flash = 0
 
     const bulletGeometry = new THREE.CylinderGeometry(0.02, 0.07, 1, 6, 1, true)
@@ -375,7 +424,7 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         const from = origin ?? muzzle.getWorldPosition(position)
         const target = scatter(direction, config.spread)
         if (bullets.length >= config.maxBullets) bullets.shift()
-        bullets.push(createBullet({ x: from.x, y: from.y, z: from.z }, target, config))
+        bullets.push(createBullet({ x: from.x, y: from.y, z: from.z }, target, config, shooter))
         // The flash mesh is parented to the local muzzle, so only light it for the local gun.
         if (shooter === LOCAL_SHOOTER) {
             flash = 1
@@ -384,7 +433,8 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         return true
     }
 
-    function update(seconds: number, terrainHeight: (x: number, z: number) => number) {
+    function update(seconds: number, terrainHeight: (x: number, z: number) => number, targets?: BulletTarget[]) {
+        hits.length = 0
         cooldowns.forEach((remaining, shooter) => cooldowns.set(shooter, Math.max(0, remaining - seconds)))
         if (flash > 0) {
             flash = Math.max(0, flash - seconds * 18)
@@ -394,8 +444,14 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         }
 
         for (let index = bullets.length - 1; index >= 0; index--) {
-            const result = stepBullet(bullets[index]!, seconds, terrainHeight, config)
+            const bullet = bullets[index]!
+            // A peer's round is decorative on our screen, so only our own shots can wound a bird.
+            const result = stepBullet(bullet, seconds, terrainHeight, config, bullet.owner === LOCAL_SHOOTER ? targets : undefined)
             if (result.impact) spawnImpact(result.impact)
+            if (result.hit) {
+                spawnImpact(result.hit)
+                hits.push(result.hit)
+            }
             if (result.dead) bullets.splice(index, 1)
             else bullets[index] = result.bullet
         }
@@ -468,6 +524,7 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         }
         sparkPositionAttribute.needsUpdate = true
         sparkColorAttribute.needsUpdate = true
+        return hits
     }
 
     function dispose() {
@@ -488,6 +545,7 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         bullets.length = 0
         impacts.length = 0
         sparks.length = 0
+        hits.length = 0
     }
 
     return { fire, update, dispose }

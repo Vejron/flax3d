@@ -8,6 +8,16 @@ export interface FlightState {
     verticalSpeed: number
     charge: number
     flying: boolean
+    /** Remaining hit points; the owning client is authoritative over its own value. */
+    health: number
+    /** True from the killing blow until the respawn timer expires. */
+    dead: boolean
+    /** Seconds left before respawning; only counts down once the wreck is on the ground. */
+    respawn: number
+    /** Accumulated tumble angle used by the renderer while dying. */
+    spin: number
+    /** Hit-shake intensity in `0..1`, decaying over `shakeTime`. */
+    shake: number
 }
 
 export interface FlightControls {
@@ -49,12 +59,39 @@ export const flightConfig = {
     glideLift: 0.075,
     passiveSink: 2.5,
     maxGlideLift: 22,
+    maxHealth: 100,
+    damagePerHit: 25,
+    respawnDelay: 2.5,
+    shakeTime: 0.4,
+    deathSpinRate: 9,
+    deathFallSpeed: 40,
+    deathDrag: 1.6,
 }
 
 export type FlightConfig = typeof flightConfig
 
 export function initialFlightState(ground: number): FlightState {
-    return { x: 0, y: ground, z: 0, yaw: 0, bank: 0, speed: 0, verticalSpeed: 0, charge: 0, flying: false }
+    return {
+        x: 0, y: ground, z: 0, yaw: 0, bank: 0, speed: 0, verticalSpeed: 0, charge: 0, flying: false,
+        health: flightConfig.maxHealth, dead: false, respawn: 0, spin: 0, shake: 0,
+    }
+}
+
+/** Puts a fresh, fully repaired bird back at a spawn point. */
+export function respawnFlight(ground: number, spawn: { x: number; z: number; yaw: number }): FlightState {
+    return { ...initialFlightState(ground), x: spawn.x, z: spawn.z, yaw: spawn.yaw }
+}
+
+/**
+ * Applies one or more incoming hits. Damage is reported by the shooter's client, so this runs on
+ * the victim: it owns its own health and decides when it dies. A killing blow starts the wreck
+ * falling and arms the respawn timer.
+ */
+export function applyHit(state: FlightState, damage: number, config: FlightConfig = flightConfig): FlightState {
+    if (state.dead || !Number.isFinite(damage) || damage <= 0) return state
+    const health = Math.max(0, state.health - damage)
+    if (health > 0) return { ...state, health, shake: 1 }
+    return { ...state, health: 0, shake: 1, dead: true, respawn: config.respawnDelay, flying: false, charge: 0 }
 }
 
 export function stepFlight(
@@ -66,6 +103,27 @@ export function stepFlight(
 ): FlightState {
     const dt = Math.min(Math.max(seconds, 0), config.maxTimeStep)
     const next = { ...state }
+    next.shake = Math.max(0, next.shake - dt / config.shakeTime)
+
+    if (next.dead) {
+        // No control authority while dying: gravity takes over, drag bleeds off the remaining
+        // speed and the body tumbles. The respawn timer only starts once the wreck is grounded.
+        next.verticalSpeed = Math.max(-config.deathFallSpeed, next.verticalSpeed - config.gravity * dt)
+        next.speed = Math.max(0, next.speed * (1 - config.deathDrag * dt))
+        next.spin += config.deathSpinRate * dt
+        next.x += Math.sin(next.yaw) * next.speed * dt
+        next.z -= Math.cos(next.yaw) * next.speed * dt
+        next.y += next.verticalSpeed * dt
+        const wreckGround = terrainHeight(next.x, next.z)
+        if (next.y <= wreckGround) {
+            next.y = wreckGround
+            next.verticalSpeed = 0
+            next.speed = 0
+            next.respawn = Math.max(0, next.respawn - dt)
+        }
+        return next
+    }
+
     const spread = Math.max(0, Math.min(1, controls.spread))
     const steer = Math.max(-1, Math.min(1, controls.steer))
     const flapPower = Math.max(0, Math.min(config.maxWingPower, controls.flapPower ?? 0))
