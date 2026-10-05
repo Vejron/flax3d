@@ -39,7 +39,7 @@ describe('weapon ballistics', () => {
     })
 
     it('samples the path closely enough to catch a fast vertical round', () => {
-        const result = stepBullet(createBullet({ x: 0, y: 4, z: 0 }, { x: 0, y: -1, z: 0 }), 0.05, flat)
+        const result = stepBullet(createBullet({ x: 0, y: 2, z: 0 }, { x: 0, y: -1, z: 0 }), 0.05, flat)
         expect(result.impact).not.toBeNull()
         expect(result.dead).toBe(true)
     })
@@ -148,7 +148,7 @@ describe('weapon ballistics', () => {
     })
 
     it('detects a bird in flight before the ground behind it', () => {
-        const target = { id: 3, x: 0, y: 0, z: -30, radius: 1.5 }
+        const target = { id: 3, x: 0, y: 0, z: -15, radius: 1.5 }
         let bullet = createBullet({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: -1 })
         let hit = null
         for (let step = 0; step < 40 && !hit; step++) {
@@ -169,7 +169,7 @@ describe('weapon ballistics', () => {
         muzzle.updateMatrixWorld(true)
         const rig = createWeaponRig(scene, muzzle)
         const aim = new THREE.Vector3(0, 0, -1)
-        const target = { id: 5, x: 0, y: 0, z: -20, radius: 1.5 }
+        const target = { id: 5, x: 0, y: 0, z: -10, radius: 1.5 }
 
         expect(rig.fire(aim)).toBe(true)
         const local = rig.update(0.2, () => -100, [target])

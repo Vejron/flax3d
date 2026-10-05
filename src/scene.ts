@@ -348,11 +348,9 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         camera.position.lerp(cameraTarget, 1 - Math.exp(-3 * dt))
         camera.lookAt(state.x + Math.sin(cameraYaw) * 7, state.y + 1, state.z - Math.cos(cameraYaw) * 7)
         flyer.updateMatrixWorld(true)
-        // Aim along the flight path, so a dive throws rounds downward and a climb lobs them upward.
+        // Fire level along the bird's heading; gravity alone provides the drop.
         if (fire) {
-            const pitch = Math.atan2(state.verticalSpeed, Math.max(1, state.speed)) * 0.65
-            const cosPitch = Math.cos(pitch)
-            aimDirection.set(Math.sin(state.yaw) * cosPitch, Math.sin(pitch), -Math.cos(state.yaw) * cosPitch)
+            aimDirection.set(Math.sin(state.yaw), 0, -Math.cos(state.yaw))
             weapon.fire(aimDirection)
         }
         refreshHitTargets()

@@ -20,9 +20,9 @@ export interface Bullet {
 
 export const weaponConfig = {
     /** Muzzle speed in metres per second. */
-    speed: 110,
+    speed: 55,
     /** Downward acceleration applied to every bullet, in m/s². This is what produces the drop. */
-    gravity: 11,
+    gravity: 24,
     /** Seconds a bullet stays alive before it is recycled. */
     life: 4,
     /** Aim scatter half-angle in radians. */
