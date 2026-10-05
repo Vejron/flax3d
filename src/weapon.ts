@@ -216,6 +216,92 @@ export interface Gun {
 }
 
 /**
+ * Upward tilt of the gun mount, in radians. Applied both to the barrel mesh and
+to the local shot direction so the visual and the ballistics agree.
+ */
+export const gunPitch = THREE.MathUtils.degToRad(10)
+
+/**
+ * Writes the local shot direction into `out`: the bird's heading pitched up by the gun mount.
+ * Both the gun and the body-mode auto-fire cone use this, so the volume the player aims into can
+ * never disagree with where the round actually goes.
+ */
+export function writeAimFromYaw<T extends Vec3>(yaw: number, out: T): T {
+    const cosPitch = Math.cos(gunPitch)
+    out.x = Math.sin(yaw) * cosPitch
+    out.y = Math.sin(gunPitch)
+    out.z = -Math.cos(yaw) * cosPitch
+    return out
+}
+
+/** Shape of the auto-fire trigger volume: `range` is its length and `halfAngle` sets its width. */
+export interface AutoFireOptions {
+    /** Maximum lock distance in metres. */
+    range: number
+    /** Cone half-angle in radians. */
+    halfAngle: number
+    /** Seconds of continuous alignment required before the first shot. */
+    dwell: number
+}
+
+/** A bird the cone can lock; positions are raw flight coordinates (no avatar offset). */
+export interface AutoFireTarget {
+    x: number
+    y: number
+    z: number
+}
+
+export interface AutoFireResult {
+    /** Seconds the cone has been held; carry this into the next call. */
+    lock: number
+    /** True while a target sits inside the forward cone. */
+    locked: boolean
+    /** True once the cone has been held for `dwell` seconds, so the trigger should be pulled now. */
+    fire: boolean
+}
+
+/** Scratch aim reused by `updateAutoFire` so the frame loop allocates nothing. */
+const autoFireAim: Vec3 = { x: 0, y: 0, z: 0 }
+
+/**
+ * Advances the auto-fire trigger volume one frame. A target is locked while it sits inside a cone
+ * of `range` metres and `halfAngle` radians around the gun axis; `fire` only opens up once the cone
+ * has been held for `dwell` seconds. `targets` must already exclude wrecks. The caller owns `lock`
+ * between frames and must reset it whenever the cone is switched off.
+ */
+export function updateAutoFire(
+    lock: number,
+    seconds: number,
+    origin: Vec3,
+    yaw: number,
+    targets: readonly AutoFireTarget[],
+    options: AutoFireOptions,
+): AutoFireResult {
+    const aim = writeAimFromYaw(yaw, autoFireAim)
+    const cosLimit = Math.cos(options.halfAngle)
+    const rangeSquared = options.range * options.range
+    let locked = false
+    for (const target of targets) {
+        const dx = target.x - origin.x
+        const dy = target.y - origin.y
+        const dz = target.z - origin.z
+        const distanceSquared = dx * dx + dy * dy + dz * dz
+        if (distanceSquared > rangeSquared) continue
+        const distance = Math.sqrt(distanceSquared)
+        if (distance === 0) {
+            locked = true
+            break
+        }
+        if ((dx * aim.x + dy * aim.y + dz * aim.z) / distance >= cosLimit) {
+            locked = true
+            break
+        }
+    }
+    const next = locked ? lock + Math.max(0, seconds) : 0
+    return { lock: next, locked, fire: locked && next >= options.dwell }
+}
+
+/**
  * Adds a forward-facing cannon on the flyer's back and returns its muzzle
  * marker, which the weapon rig uses as the spawn point for rounds. It sits
  * above the body silhouette so the chase camera never occludes it.
@@ -242,6 +328,8 @@ export function createGun(flyer: THREE.Object3D): Gun {
 
     group.add(barrel, housing, pylon, sight, muzzle)
     group.position.set(0, 1, -0.3)
+    // Nose the whole mount up so the barrel (and the muzzle marker) aim slightly skyward.
+    group.rotation.x = gunPitch
     flyer.add(group)
 
     return {

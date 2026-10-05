@@ -3,7 +3,7 @@ import { courseRings, courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
 import type { RemoteFlight } from './network'
 import { terrainHeight } from './terrain'
-import { createGun, createWeaponRig, type BulletTarget } from './weapon'
+import { createGun, createWeaponRig, type BulletTarget, writeAimFromYaw } from './weapon'
 
 /** Radius of the sphere bullets test against a bird, in metres. */
 const BIRD_HIT_RADIUS = 1.5
@@ -348,11 +348,9 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         camera.position.lerp(cameraTarget, 1 - Math.exp(-3 * dt))
         camera.lookAt(state.x + Math.sin(cameraYaw) * 7, state.y + 1, state.z - Math.cos(cameraYaw) * 7)
         flyer.updateMatrixWorld(true)
-        // Fire level along the bird's heading; gravity alone provides the drop.
-        if (fire) {
-            aimDirection.set(Math.sin(state.yaw), 0, -Math.cos(state.yaw))
-            weapon.fire(aimDirection)
-        }
+        // Fire along the bird's heading, tilted up by the gun mount; gravity provides the drop.
+        // `writeAimFromYaw` is shared with the auto-fire cone so the two axes cannot drift apart.
+        if (fire) weapon.fire(writeAimFromYaw(state.yaw, aimDirection))
         refreshHitTargets()
         for (const hit of weapon.update(dt, terrainHeight, hitTargets)) handlers.onHit?.(hit.targetId)
         for (const trail of trails) {

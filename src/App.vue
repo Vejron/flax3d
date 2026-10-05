@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Camera, CameraOff, Crosshair, Keyboard, MoveUp, RotateCcw, SlidersHorizontal, Wind, X } from 'lucide-vue-next'
+import { Camera, CameraOff, Crosshair, Keyboard, MoveUp, RotateCcw, SlidersHorizontal, Target, Wind, X } from 'lucide-vue-next'
 import type { Pose, PoseDetector } from '@tensorflow-models/pose-detection'
 import { advanceCourse, courseRings, courseSpawn, type CourseProgress } from './course'
 import { applyHit, flightConfig, initialFlightState, respawnFlight, stepFlight, type FlightConfig, type FlightControls } from './flight'
 import { createMinimap } from './minimap'
-import { FlightNetwork } from './network'
+import { FlightNetwork, type RemoteFlight } from './network'
 import { PoseControls } from './poseControls'
 import { createScene, terrainHeight } from './scene'
+import { updateAutoFire, type AutoFireTarget } from './weapon'
 
 const viewport = ref<HTMLElement | null>(null)
 const video = ref<HTMLVideoElement | null>(null)
@@ -25,6 +26,10 @@ const liftOutput = ref(0)
 const settingsOpen = ref(false)
 // Hidden by default so the sky stays clear; the header "Flight controls" button toggles it.
 const instructionsOpen = ref(false)
+// Body-mode auto-fire: opt-in, and inert unless pose tracking is live.
+const autoFireEnabled = ref(false)
+const autoFireLocked = ref(false)
+const autoFireFiring = ref(false)
 const tuning = reactive<FlightConfig>({ ...flightConfig })
 type TuningField = { key: keyof FlightConfig; label: string; min: number; max: number; step: number }
 const settingGroups: { title: string; fields: TuningField[] }[] = [
@@ -80,6 +85,9 @@ const settingGroups: { title: string; fields: TuningField[] }[] = [
       { key: 'maxHealth', label: 'Max health', min: 25, max: 200, step: 5 },
       { key: 'damagePerHit', label: 'Damage per hit', min: 5, max: 100, step: 5 },
       { key: 'respawnDelay', label: 'Respawn delay', min: 0.5, max: 8, step: 0.5 },
+      { key: 'autoFireRange', label: 'Auto-fire range', min: 10, max: 150, step: 5 },
+      { key: 'autoFireAngle', label: 'Auto-fire cone', min: 2, max: 45, step: 1 },
+      { key: 'autoFireDwell', label: 'Auto-fire dwell', min: 0, max: 1, step: 0.05 },
     ]
   },
 ]
@@ -90,6 +98,12 @@ const mode = computed(() => flight.value.dead ? 'ELIMINATED' : flight.value.flyi
 const healthPercent = computed(() => Math.max(0, Math.min(100, (flight.value.health / tuning.maxHealth) * 100)))
 const latencyClass = computed(() => latencyMs.value === null ? '' : latencyMs.value > 250 ? 'latency-bad' : latencyMs.value > 120 ? 'latency-warn' : '')
 const altitude = computed(() => Math.max(0, flight.value.y - terrainHeight(flight.value.x, flight.value.z)))
+const autoFireStatus = computed(() => {
+  if (!autoFireEnabled.value) return 'OFF'
+  if (cameraStatus.value !== 'tracking' || !flight.value.flying || flight.value.dead) return 'IDLE'
+  if (!autoFireLocked.value) return 'SEEKING'
+  return autoFireFiring.value ? 'FIRING' : 'LOCKING'
+})
 const poseControls = new PoseControls()
 const keys = new Set<string>()
 let stream: MediaStream | null = null
@@ -107,6 +121,11 @@ let minimap: ReturnType<typeof createMinimap> | null = null
 let running = false
 let network: FlightNetwork | null = null
 let reconnectTimer = 0
+/** Reused auto-fire target views; the objects survive frames, mirroring the scene's hit pool. */
+const autoFireTargetPool: AutoFireTarget[] = []
+const autoFireTargets: AutoFireTarget[] = []
+/** Seconds the lock cone has been held; reset whenever auto-fire is not active. */
+let autoFireLock = 0
 
 function connectNetwork() {
   if (!running) return
@@ -142,6 +161,23 @@ function flap() { flapQueued = true }
 function startFiring() { pointerFiring = true; fireQueued = true }
 
 function stopFiring() { pointerFiring = false }
+
+/** Refills the pooled auto-fire target list, dropping peers whose wreck is still on the field. */
+function refreshAutoFireTargets(remotes: RemoteFlight[]) {
+  autoFireTargets.length = 0
+  for (const remote of remotes) {
+    if (remote.flight.health <= 0) continue
+    let target = autoFireTargetPool[autoFireTargets.length]
+    if (!target) {
+      target = { x: 0, y: 0, z: 0 }
+      autoFireTargetPool.push(target)
+    }
+    target.x = remote.flight.x
+    target.y = remote.flight.y
+    target.z = remote.flight.z
+    autoFireTargets.push(target)
+  }
+}
 
 function resetTuning() { Object.assign(tuning, flightConfig) }
 
@@ -199,8 +235,6 @@ function frame(now: number) {
     ? { ...controls.value, flap: flapQueued, flapPower: now - lastPoseAt < 150 ? controls.value.flapPower : 0 }
     : { flap: flapQueued, steer: Number(keys.has('ArrowRight') || keys.has('KeyD')) - Number(keys.has('ArrowLeft') || keys.has('KeyA')), spread: keys.has('ArrowDown') || keys.has('KeyS') ? 0 : 1 }
   flapQueued = false
-  const firing = keys.has('KeyF') || fireQueued || pointerFiring
-  fireQueued = false
   const previousFlight = flight.value
   let next = stepFlight(previousFlight, input, dt, terrainHeight, tuning)
   // Hits are reported by shooters, but the victim owns its own health, so damage is applied here.
@@ -218,6 +252,25 @@ function frame(now: number) {
   nearbyPlayers.value = remotes.length
   const rtt = network?.latencyMs ?? null
   if (rtt !== latencyMs.value) latencyMs.value = rtt
+  // Body mode leaves no free hand for the trigger: open up while a live rival sits in the cone.
+  const autoFireActive = autoFireEnabled.value && tracked && flight.value.flying && !flight.value.dead
+  if (autoFireActive) {
+    refreshAutoFireTargets(remotes)
+    const gate = updateAutoFire(autoFireLock, dt, flight.value, flight.value.yaw, autoFireTargets, {
+      range: tuning.autoFireRange,
+      halfAngle: (tuning.autoFireAngle * Math.PI) / 180,
+      dwell: tuning.autoFireDwell,
+    })
+    autoFireLock = gate.lock
+    autoFireLocked.value = gate.locked
+    autoFireFiring.value = gate.fire
+  } else {
+    autoFireLock = 0
+    autoFireLocked.value = false
+    autoFireFiring.value = false
+  }
+  const firing = keys.has('KeyF') || fireQueued || pointerFiring || autoFireFiring.value
+  fireQueued = false
   minimap?.draw(flight.value, remotes)
   const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes, firing)
   network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now, firing)
@@ -324,6 +377,10 @@ onBeforeUnmount(() => {
 <template>
   <main class="game">
     <div ref="viewport" class="viewport" aria-label="3D flight scene" @pointerdown="startFiring" />
+    <div v-if="autoFireEnabled && cameraStatus === 'tracking'" class="autofire-lock"
+      :class="{ locked: autoFireLocked, firing: autoFireFiring }" role="status">
+      <Target :size="14" /> AUTO-FIRE · {{ autoFireStatus }}
+    </div>
     <div class="grain" aria-hidden="true" />
     <header class="topbar">
       <div class="brand"><span class="brand-mark">F<span>·</span></span><span>FLAX <small>FLIGHT LAB</small></span>
@@ -367,7 +424,7 @@ onBeforeUnmount(() => {
       <div class="metric"><span>01 / AIRSPEED</span><strong>{{ Math.round(flight.speed * 3.6) }}<small>
             km/h</small></strong></div>
       <div class="metric"><span>02 / HEADING</span><strong>{{ ((flight.yaw * 180 / Math.PI + 360) % 360).toFixed(0)
-          }}<small>°</small></strong></div>
+      }}<small>°</small></strong></div>
       <div class="metric course-metric"><span>03 / COURSE</span><strong>{{ courseRings[course.nextRing]?.kind ===
         'checkpoint' ?
         `${course.nextRing} / ${courseRings.length - 2}` : courseRings[course.nextRing]?.kind?.toUpperCase() }}<small>
@@ -412,6 +469,11 @@ onBeforeUnmount(() => {
               @click="calibrate">
               <Crosshair :size="18" /><span class="sr-only">Calibrate</span>
             </button>
+            <button class="autofire-toggle" type="button" :class="{ active: autoFireEnabled }"
+              :aria-pressed="autoFireEnabled" :disabled="cameraStatus !== 'tracking'"
+              title="Auto-fire while a rival is in the lock cone" @click="autoFireEnabled = !autoFireEnabled">
+              <Target :size="18" /><span class="sr-only">Auto-fire</span>
+            </button>
             <button type="button" title="Turn off camera" @click="stopCamera">
               <CameraOff :size="18" /><span class="sr-only">Turn off camera</span>
             </button>
@@ -422,14 +484,14 @@ onBeforeUnmount(() => {
       <section v-if="instructionsOpen" class="instruction-panel" aria-label="Flight controls">
         <div class="instruction-heading">
           <Wind :size="18" /> <span>{{ cameraStatus === 'tracking' ? 'FLY WITH YOUR BODY' : 'FLY WITH YOUR KEYBOARD'
-            }}</span>
+          }}</span>
         </div>
         <div class="instructions" v-if="cameraStatus === 'tracking'">
           <div><span>01</span> Raise & lower both arms <strong>FLAP</strong></div>
           <div><span>02</span> Hold wings level <strong>GLIDE</strong></div>
           <div><span>03</span> Tilt one wing <strong>STEER</strong></div>
           <div><span>04</span> Angle wings down <strong>DIVE</strong></div>
-          <div><span>05</span> Press <kbd>F</kbd> or click the sky <strong>FIRE</strong></div>
+          <div><span>05</span> Aim at a rival <strong>AUTO-FIRE</strong></div>
         </div>
         <div class="instructions" v-else>
           <div><kbd>SPACE</kbd> Tap to flap <strong>TAKE OFF</strong></div>
@@ -526,6 +588,33 @@ button:disabled {
   pointer-events: none;
   opacity: .14;
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.22'/%3E%3C/svg%3E");
+}
+
+.autofire-lock {
+  position: absolute;
+  top: 96px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  background: #1b372dd9;
+  color: #a9c9b3;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.autofire-lock.locked {
+  color: #ffd98a;
+}
+
+.autofire-lock.firing {
+  color: #2b362e;
+  background: #f0a271;
 }
 
 .topbar {
@@ -1062,6 +1151,11 @@ button:disabled {
 .camera-buttons button {
   width: 32px;
   height: 32px;
+}
+
+.camera-buttons button.autofire-toggle.active {
+  background: #cd6748;
+  color: #fff4e6;
 }
 
 .error {

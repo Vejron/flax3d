@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import * as THREE from 'three'
 
-import { createBullet, createGun, createWeaponRig, scatter, stepBullet, terrainNormal, weaponConfig } from '../weapon'
+import { createBullet, createGun, createWeaponRig, gunPitch, scatter, stepBullet, terrainNormal, updateAutoFire, weaponConfig, writeAimFromYaw } from '../weapon'
 
 describe('weapon ballistics', () => {
     const flat = () => 0
@@ -181,5 +181,62 @@ describe('weapon ballistics', () => {
         expect(rig.update(0.2, () => -100, [target])).toHaveLength(0)
 
         rig.dispose()
+    })
+})
+
+describe('auto-fire cone', () => {
+    // Match the shipped Combat-group defaults: 60 m of reach, a 12° half-angle, 0.2 s of dwell.
+    const halfAngle = (12 * Math.PI) / 180
+    const options = { range: 60, halfAngle, dwell: 0.2 }
+    const origin = { x: 0, y: 0, z: 0 }
+    /** A point `distance` metres along an axis pitched `pitch` above the horizon, dead ahead. */
+    const along = (pitch: number, distance: number) => ({
+        x: 0,
+        y: Math.sin(pitch) * distance,
+        z: -Math.cos(pitch) * distance,
+    })
+
+    it('shares one pitched aim axis between the gun and the cone', () => {
+        const aim = writeAimFromYaw(0, { x: 0, y: 0, z: 0 })
+        expect(Math.hypot(aim.x, aim.y, aim.z)).toBeCloseTo(1, 6)
+        expect(aim.y).toBeCloseTo(Math.sin(gunPitch), 6)
+        expect(aim.z).toBeCloseTo(-Math.cos(gunPitch), 6)
+        const turned = writeAimFromYaw(Math.PI / 2, { x: 0, y: 0, z: 0 })
+        expect(turned.x).toBeCloseTo(Math.cos(gunPitch), 6)
+        expect(turned.z).toBeCloseTo(0, 6)
+    })
+
+    it('locks a bird on the gun axis and ignores one behind or out of range', () => {
+        const onAxis = along(gunPitch, 40)
+        expect(updateAutoFire(0, 0.05, origin, 0, [onAxis], options).locked).toBe(true)
+        // Same distance, reversed: behind the bird.
+        expect(updateAutoFire(0, 0.05, origin, 0, [{ x: 0, y: 0, z: 40 }], options).locked).toBe(false)
+        // Directly ahead but past the cone's length.
+        expect(updateAutoFire(0, 0.05, origin, 0, [along(gunPitch, options.range + 20)], options).locked).toBe(false)
+    })
+
+    it('tolerates the cone half-angle but not a bird a little wider', () => {
+        const inside = along(gunPitch + halfAngle * 0.9, 35)
+        const outside = along(gunPitch + halfAngle * 1.5, 35)
+        expect(updateAutoFire(0, 0.05, origin, 0, [inside], options).locked).toBe(true)
+        expect(updateAutoFire(0, 0.05, origin, 0, [outside], options).locked).toBe(false)
+    })
+
+    it('opens fire only after the cone is held for the dwell, and resets when it is lost', () => {
+        const target = along(gunPitch, 30)
+        let state = updateAutoFire(0, 0.1, origin, 0, [target], options)
+        expect(state.locked).toBe(true)
+        expect(state.lock).toBeCloseTo(0.1, 6)
+        expect(state.fire).toBe(false)
+
+        state = updateAutoFire(state.lock, 0.1, origin, 0, [target], options)
+        expect(state.lock).toBeCloseTo(0.2, 6)
+        expect(state.fire).toBe(true)
+
+        // A beat with an empty sky clears the timer and shuts the trigger again.
+        state = updateAutoFire(state.lock, 0.05, origin, 0, [], options)
+        expect(state.locked).toBe(false)
+        expect(state.fire).toBe(false)
+        expect(state.lock).toBe(0)
     })
 })

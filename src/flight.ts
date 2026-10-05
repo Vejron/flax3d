@@ -66,6 +66,12 @@ export const flightConfig = {
     deathSpinRate: 9,
     deathFallSpeed: 40,
     deathDrag: 1.6,
+    /** Length of the body-mode auto-fire lock cone, in metres. */
+    autoFireRange: 60,
+    /** Half-angle of the body-mode auto-fire lock cone, in degrees. */
+    autoFireAngle: 12,
+    /** Seconds the cone must be held before auto-fire opens up. */
+    autoFireDwell: 0.2,
 }
 
 export type FlightConfig = typeof flightConfig

@@ -45,6 +45,20 @@ describe('App', () => {
     expect(wrapper.get('output[for="setting-maxSpeed"]').text()).toBe('24.0')
     wrapper.unmount()
   })
+
+  it('exposes the body-mode auto-fire cone as live combat tuning', async () => {
+    const wrapper = mount(App)
+    // The toggle is only offered once a camera feed exists, so keyboard players see nothing new.
+    expect(wrapper.find('.autofire-toggle').exists()).toBe(false)
+    await wrapper.get('button[aria-label="Flight settings"]').trigger('click')
+    expect(wrapper.get('output[for="setting-autoFireRange"]').text()).toBe('60')
+    await wrapper.get('#setting-autoFireAngle').setValue('20')
+    expect(wrapper.get('output[for="setting-autoFireAngle"]').text()).toBe('20')
+    expect(flightConfig.autoFireAngle).toBe(12)
+    await wrapper.get('.settings-reset').trigger('click')
+    expect(wrapper.get('output[for="setting-autoFireAngle"]').text()).toBe('12')
+    wrapper.unmount()
+  })
 })
 
 describe('flight', () => {
