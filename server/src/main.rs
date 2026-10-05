@@ -94,14 +94,13 @@ impl Default for Position {
 #[derive(Deserialize)]
 struct Update(u8, u32, Position);
 
+/// A relayed event, encoded once at construction. `Bytes` clones by refcount, so every subscriber
+/// writes the same buffer instead of re-serialising the event once per recipient.
 #[derive(Clone)]
 struct Event {
     kind: EventKind,
     id: u64,
-    sequence: u32,
-    position: Position,
-    /// Victim of a `Hit` event; unused by the other kinds.
-    victim: u64,
+    bytes: Bytes,
 }
 
 #[derive(Clone, Copy)]
@@ -113,21 +112,26 @@ enum EventKind {
 }
 
 impl Event {
-    fn welcome(id: u64) -> Self {
-        Self { kind: EventKind::Welcome, id, sequence: 0, position: Position::default(), victim: 0 }
+    fn welcome(id: u64) -> Result<Self, salvo::Error> {
+        Self::encode(EventKind::Welcome, id, &(EVENT_WELCOME, id))
     }
 
-    fn state(id: u64, sequence: u32, position: Position) -> Self {
-        Self { kind: EventKind::State, id, sequence, position, victim: 0 }
+    fn state(id: u64, sequence: u32, position: Position) -> Result<Self, salvo::Error> {
+        Self::encode(EventKind::State, id, &(EVENT_STATE, id, sequence, position))
     }
 
-    fn leave(id: u64) -> Self {
-        Self { kind: EventKind::Leave, id, sequence: 0, position: Position::default(), victim: 0 }
+    fn leave(id: u64) -> Result<Self, salvo::Error> {
+        Self::encode(EventKind::Leave, id, &(EVENT_LEAVE, id))
     }
 
     /// `id` is the shooter, `victim` the player it claims to have hit.
-    fn hit(id: u64, victim: u64) -> Self {
-        Self { kind: EventKind::Hit, id, sequence: 0, position: Position::default(), victim }
+    fn hit(id: u64, victim: u64) -> Result<Self, salvo::Error> {
+        Self::encode(EventKind::Hit, id, &(EVENT_HIT, id, victim))
+    }
+
+    fn encode(kind: EventKind, id: u64, value: &impl Serialize) -> Result<Self, salvo::Error> {
+        let bytes = rmp_serde::to_vec(value).map_err(salvo::Error::other)?;
+        Ok(Self { kind, id, bytes: Bytes::from(bytes) })
     }
 }
 
@@ -136,19 +140,6 @@ const EVENT_STATE: u8 = 1;
 const EVENT_LEAVE: u8 = 2;
 const EVENT_HIT: u8 = 3;
 const EVENT_PONG: u8 = 4;
-
-fn event_bytes(event: &Event) -> Result<Bytes, salvo::Error> {
-    let bytes = match event.kind {
-        EventKind::Welcome => rmp_serde::to_vec(&(EVENT_WELCOME, event.id)),
-        EventKind::State => {
-            rmp_serde::to_vec(&(EVENT_STATE, event.id, event.sequence, &event.position))
-        }
-        EventKind::Leave => rmp_serde::to_vec(&(EVENT_LEAVE, event.id)),
-        EventKind::Hit => rmp_serde::to_vec(&(EVENT_HIT, event.id, event.victim)),
-    }
-    .map_err(salvo::Error::other)?;
-    Ok(Bytes::from(bytes))
-}
 
 #[derive(Clone)]
 struct Player {
@@ -170,7 +161,9 @@ struct PlayerGuard {
 impl Drop for PlayerGuard {
     fn drop(&mut self) {
         self.room.players.lock().unwrap().remove(&self.id);
-        let _ = self.room.events.send(Event::leave(self.id));
+        if let Ok(leave) = Event::leave(self.id) {
+            let _ = self.room.events.send(leave);
+        }
     }
 }
 
@@ -250,7 +243,7 @@ impl Relay {
                 .map(|(&id, player)| {
                     Event::state(id, player.sequence, player.position.clone())
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             players.insert(
                 id,
                 Player {
@@ -267,14 +260,13 @@ impl Relay {
         let session_id = session.session_id();
         let mut reader = session.datagram_reader();
         let mut sender = session.datagram_sender();
+        let welcome = Event::welcome(id)?;
         let mut stream = session.open_uni(session_id).await?;
-        stream
-            .write_all(&event_bytes(&Event::welcome(id))?)
-            .await?;
+        stream.write_all(&welcome.bytes).await?;
         stream.shutdown().await?;
-        for player in &snapshot {
+        for event in &snapshot {
             let mut stream = session.open_uni(session_id).await?;
-            stream.write_all(&event_bytes(player)?).await?;
+            stream.write_all(&event.bytes).await?;
             stream.shutdown().await?;
         }
         let mut last_update = Instant::now() - StdDuration::from_secs(1);
@@ -297,7 +289,7 @@ impl Relay {
                             player.position = update.2.clone();
                         }
                         last_update = Instant::now();
-                        let _ = room.events.send(Event::state(id, update.1, update.2));
+                        let _ = room.events.send(Event::state(id, update.1, update.2)?);
                     } else if let Ok((tag, value)) = rmp_serde::from_slice::<(u8, u64)>(&payload) {
                         // Both control messages are two-element `[tag, value]` arrays, so they share
                         // a decode and are told apart by tag. Each gets its own throttle rather than
@@ -307,7 +299,7 @@ impl Relay {
                             if last_hit.elapsed() < StdDuration::from_millis(25) { continue; }
                             if value == id || !room.players.lock().unwrap().contains_key(&value) { continue; }
                             last_hit = Instant::now();
-                            let _ = room.events.send(Event::hit(id, value));
+                            let _ = room.events.send(Event::hit(id, value)?);
                         } else if tag == MESSAGE_PING {
                             // Latency probe: echo the nonce straight back on a datagram. No timing
                             // is kept server-side, so the client measures the whole round trip.
@@ -323,10 +315,11 @@ impl Relay {
                         Ok(event) => {
                             if event.id == id && matches!(event.kind, EventKind::State | EventKind::Hit) { continue; }
                             if matches!(event.kind, EventKind::State) {
-                                if sender.send_datagram(event_bytes(&event)?).is_err() { break; }
+                                // Encoded once at construction, so every peer writes the same buffer.
+                                if sender.send_datagram(event.bytes.clone()).is_err() { break; }
                             } else {
                                 let mut stream = session.open_uni(session_id).await?;
-                                stream.write_all(&event_bytes(&event)?).await?;
+                                stream.write_all(&event.bytes).await?;
                                 stream.shutdown().await?;
                             }
                         }
@@ -461,13 +454,13 @@ mod tests {
 
     #[test]
     fn encodes_events_as_tagged_arrays() {
-        let welcome = event_bytes(&Event::welcome(4)).unwrap();
+        let welcome = Event::welcome(4).unwrap().bytes;
         assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&welcome).unwrap(), (EVENT_WELCOME, 4));
 
-        let leave = event_bytes(&Event::leave(4)).unwrap();
+        let leave = Event::leave(4).unwrap().bytes;
         assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&leave).unwrap(), (EVENT_LEAVE, 4));
 
-        let state = event_bytes(&Event::state(9, 3, position())).unwrap();
+        let state = Event::state(9, 3, position()).unwrap().bytes;
         let (kind, id, sequence, decoded) =
             rmp_serde::from_slice::<(u8, u64, u32, Position)>(&state).unwrap();
         assert_eq!((kind, id, sequence), (EVENT_STATE, 9, 3));
@@ -475,9 +468,17 @@ mod tests {
         assert!(state.len() < 64);
     }
 
+    /// Relaying an event to many peers must not re-serialise it: cloning shares one buffer.
+    #[test]
+    fn cloning_an_event_shares_the_encoded_buffer() {
+        let event = Event::state(9, 3, position()).unwrap();
+        let clone = event.clone();
+        assert_eq!(clone.bytes.as_ptr(), event.bytes.as_ptr());
+    }
+
     #[test]
     fn encodes_hit_events_with_the_shooter_stamped() {
-        let bytes = event_bytes(&Event::hit(4, 9)).unwrap();
+        let bytes = Event::hit(4, 9).unwrap().bytes;
         let (kind, shooter, victim) = rmp_serde::from_slice::<(u8, u64, u64)>(&bytes).unwrap();
         assert_eq!((kind, shooter, victim), (EVENT_HIT, 4, 9));
         assert!(bytes.len() < 32);

@@ -15,9 +15,20 @@ export interface WingAngles {
     right: number
 }
 
-/** Position updates are sent at 20 Hz; remote motion is interpolated across the measured arrival gap. */
+/** Position updates are sent at 20 Hz; remote motion is played back from a buffered history. */
 const SEND_INTERVAL_MS = 50
+/** Assumed send interval until a second snapshot has been measured. */
 const DEFAULT_INTERVAL_MS = 100
+/** Render remote motion this many smoothed intervals behind the newest snapshot, so a late or
+ *  dropped datagram is absorbed by the buffer instead of stalling or speeding up playback. */
+const INTERP_DELAY_INTERVALS = 2
+/** Snapshot history kept per player; a few intervals is ample to bracket the render cursor. */
+const MAX_SNAPSHOTS = 8
+/** A gap this many times the smoothed interval is treated as a dropped datagram, not a slower
+ *  sender, so it never widens the render window. */
+const LOSS_GAP_FACTOR = 1.5
+/** Weight of each accepted arrival gap in the smoothed send interval. */
+const INTERVAL_SMOOTHING = 0.1
 /** The latency probe is sent once a second; the smoothed round trip is what the HUD shows. */
 const PING_INTERVAL_MS = 1000
 /** Weight of each new sample in the smoothed latency, so one slow packet barely moves it. */
@@ -50,6 +61,9 @@ const quantize = (value: number, scale: number) => (Number.isFinite(value) ? Mat
 /** yaw is unbounded locally; wrapping it keeps a 16-bit milliradian field precise. */
 const normalizeYaw = (yaw: number) => Math.atan2(Math.sin(yaw), Math.cos(yaw))
 
+/** Keep a measured send interval inside the range a real sender can produce. */
+const clampInterval = (ms: number) => Math.min(300, Math.max(40, ms))
+
 type WireValue = number | boolean
 
 function encodePosition(flight: FlightState, input: FlightControls, wings: WingAngles, fire: boolean): WireValue[] {
@@ -67,6 +81,20 @@ function encodePosition(flight: FlightState, input: FlightControls, wings: WingA
 }
 
 type DecodedPosition = RemoteFlight['flight'] & { spread: number; flap: boolean; fire: boolean }
+
+/** One relayed snapshot, stamped with the local time it arrived. */
+interface Snapshot {
+    at: number
+    remote: RemoteFlight
+}
+
+/** Per-player playback state: a short snapshot history plus the smoothed send interval (ms). */
+interface RemoteTrack {
+    snapshots: Snapshot[]
+    interval: number
+    sequence: number
+    receivedAt: number
+}
 
 /** Encodes one position update. Exported so tests can pin the exact wire bytes. */
 export function encodeUpdate(sequence: number, flight: FlightState, input: FlightControls, wings: WingAngles, fire: boolean): Uint8Array {
@@ -93,7 +121,7 @@ function decodePosition(raw: unknown): DecodedPosition | null {
 export class FlightNetwork {
     private transport: WebTransport | null = null
     private writer: WritableStreamDefaultWriter<Uint8Array> | null = null
-    private players = new Map<number, { previous: RemoteFlight; current: RemoteFlight; receivedAt: number; sequence: number; interval: number }>()
+    private players = new Map<number, RemoteTrack>()
     private id: number | null = null
     private sequence = 0
     private stopped = false
@@ -196,12 +224,31 @@ export class FlightNetwork {
             const position = decodePosition(message[3])
             if (!position) return
             const playerId = id as number
-            const current: RemoteFlight = { id: playerId, flight: position, spread: position.spread, flap: position.flap, fire: position.fire }
-            const last = this.players.get(playerId)
-            if (last && (sequence as number) <= last.sequence) return
             const now = performance.now()
-            const interval = last ? Math.min(300, Math.max(40, now - last.receivedAt)) : DEFAULT_INTERVAL_MS
-            this.players.set(playerId, { previous: last?.current ?? current, current, receivedAt: now, sequence: sequence as number, interval })
+            let track = this.players.get(playerId)
+            if (!track) {
+                track = { snapshots: [], interval: DEFAULT_INTERVAL_MS, sequence: -1, receivedAt: now }
+                this.players.set(playerId, track)
+            }
+            if (track.snapshots.length > 0 && (sequence as number) <= track.sequence) return
+            if (track.snapshots.length > 0) {
+                const gap = now - track.receivedAt
+                // A gap far wider than the smoothed interval means a datagram was lost, not that the
+                // sender slowed down; folding it in would halve the playback rate for the next window.
+                // The first measured gap is trusted outright so playback reaches the right rate at once.
+                if (gap <= track.interval * LOSS_GAP_FACTOR) {
+                    track.interval = track.snapshots.length === 1
+                        ? clampInterval(gap)
+                        : clampInterval(track.interval * (1 - INTERVAL_SMOOTHING) + gap * INTERVAL_SMOOTHING)
+                }
+            }
+            track.sequence = sequence as number
+            track.receivedAt = now
+            track.snapshots.push({
+                at: now,
+                remote: { id: playerId, flight: position, spread: position.spread, flap: position.flap, fire: position.fire },
+            })
+            if (track.snapshots.length > MAX_SNAPSHOTS) track.snapshots.shift()
         }
     }
 
@@ -248,14 +295,28 @@ export class FlightNetwork {
 
     remotes(now: number): RemoteFlight[] {
         const result: RemoteFlight[] = []
-        for (const [id, player] of this.players) {
-            if (now - player.receivedAt > 3000) { this.players.delete(id); continue }
-            const fraction = Math.max(0, Math.min(1, (now - player.receivedAt) / player.interval))
-            const previous = player.previous.flight
-            const current = player.current.flight
+        for (const [id, track] of this.players) {
+            if (now - track.receivedAt > 3000) { this.players.delete(id); continue }
+            const snapshots = track.snapshots
+            if (snapshots.length === 0) continue
+            // Play the buffer back a couple of intervals behind the newest snapshot. That jitter
+            // margin is what keeps a late, bursty or dropped datagram from freezing the motion or
+            // making it race to catch up; the cost is the same delay on every remote avatar.
+            const renderTime = now - track.interval * INTERP_DELAY_INTERVALS
+            let older = snapshots[0]!
+            let newer = snapshots[Math.min(1, snapshots.length - 1)]!
+            for (let index = 0; index < snapshots.length - 1; index++) {
+                if (snapshots[index]!.at > renderTime) break
+                older = snapshots[index]!
+                newer = snapshots[index + 1]!
+            }
+            const span = newer.at - older.at
+            const fraction = span > 0 ? Math.max(0, Math.min(1, (renderTime - older.at) / span)) : 1
+            const previous = older.remote.flight
+            const current = newer.remote.flight
             const angle = Math.atan2(Math.sin(current.yaw - previous.yaw), Math.cos(current.yaw - previous.yaw))
             result.push({
-                ...player.current, flight: {
+                ...newer.remote, flight: {
                     ...current,
                     x: previous.x + (current.x - previous.x) * fraction,
                     y: previous.y + (current.y - previous.y) * fraction,

@@ -222,8 +222,8 @@ Damage is **shooter-reported but victim-applied**, which keeps the server out of
 
 Consequences worth knowing:
 
-- Hits are decided by the shooter against a slightly stale view of the target (up to one update of
-  interpolation), so a near miss can register and a marginal hit can be missed.
+- Hits are decided by the shooter against a slightly stale view of the target (the two-interval
+  render delay plus the network trip), so a near miss can register and a marginal hit can be missed.
 - There is no server-side validation of who hit whom. Any client can claim a hit on any other player
   in the room, so this is fine for casual play but **not** suitable for competitive scoring — the
   same caveat the README already applies to client-reported movement.
@@ -231,19 +231,28 @@ Consequences worth knowing:
 
 ## Interpolation and expiry
 
-Remote players are rendered smoothly rather than snapping to each received frame:
+Remote players are rendered smoothly rather than snapping to each received frame. Each player keeps
+a small ring buffer of the last few snapshots, each stamped with the local time it arrived, and the
+renderer plays that buffer back slightly behind real time:
 
-- Each player keeps the previous and current snapshot plus a receive timestamp.
-- `remotes(now)` interpolates position, `bank`, `wingLeft`, and `wingRight` between the two
-  snapshots, and yaw along the shortest arc.
-- `fire` is a level flag rather than an interpolated value: `remotes(now)` passes through the newest
-  snapshot's value and the renderer holds it until the next packet replaces it.
-- The interpolation window is the measured arrival gap between the last two packets, clamped to
-  40–300 ms (100 ms until a second packet arrives). This keeps motion continuous at any send rate
-  without hard-coding one.
+- `remotes(now)` renders at `now − 2 × interval`, where `interval` is the **smoothed** arrival gap
+  between accepted snapshots (weight `0.1` per sample, clamped to 40–300 ms, 100 ms until a second
+  packet arrives). Holding the render cursor two intervals behind the newest snapshot leaves a jitter
+  margin, so a late or bursty datagram is absorbed by the buffered history instead of freezing the
+  avatar or making it race to catch up. The cost is the same delay on every remote avatar.
+- The two snapshots bracketing the render time are interpolated for position, `bank`, `wingLeft`,
+  and `wingRight`; yaw interpolates along the shortest arc. Before the oldest snapshot the cursor
+  clamps to it; past the newest it holds the last pair.
+- A gap more than `1.5×` the smoothed interval is treated as a **dropped datagram**: the snapshot is
+  still buffered, but the gap is not folded into the interval, so a lost packet cannot halve the
+  playback rate for the next window. The first measured gap is trusted outright so the rate is right
+  from the second packet onward.
+- `fire` is a level flag rather than an interpolated value: `remotes(now)` passes through the newer
+  bracketing snapshot's value and the renderer holds it until a later packet replaces it.
 - The renderer additionally eases the shoulder and elbow of each wing toward its interpolated angle,
   so a 20 Hz stream still looks like continuous wingbeats.
-- A player with no update for 3 seconds is removed from the local map.
+- Up to `8` snapshots (~400 ms at 20 Hz) are kept per player; a player with no update for 3 seconds
+  is removed from the local map.
 
 ## Latency measurement
 
@@ -268,11 +277,14 @@ Positions are sent at 20 Hz and interpolated, which is a good balance for a game
   fragmented and a lost one costs very little.
 - Server egress scales as `players × (players − 1) × rate × size`. At the 32-player cap and 20 Hz
   that is about 1.7 MB/s, roughly half the JSON cost.
+- Each `Event` is MessagePack-encoded **once** when it is constructed and stores the resulting
+  `Bytes`; cloning the event to deliver it to every subscriber is a refcount bump, so the fan-out
+  cost is per-socket encryption rather than re-serialising the same state per recipient.
 - Wingbeats need the higher end of the range: at 20 Hz a ~2 Hz flap is sampled ten times per cycle,
   which reads as smooth. Going past 20–30 Hz buys little for this motion while the quadratic fan-out
   cost keeps growing.
 - 10 Hz + interpolation is a legitimate floor if bandwidth or player count becomes the constraint;
-  the measured-window interpolation adapts automatically.
+  the smoothed-interval interpolation adapts automatically.
 
 Bumping the rate means keeping three numbers in sync: `SEND_INTERVAL_MS` in `src/network.ts`, the
 `25 ms` throttle in `server/src/main.rs`, and `MAX_PACKET` if the payload grows.

@@ -113,4 +113,36 @@ describe('FlightNetwork wire format', () => {
         expect(remotes[0]!.fire).toBe(true)
         expect(remotes[0]!.flight.wingLeft).toBeCloseTo(-0.25, 6)
     })
+
+    it('interpolates remote motion from the buffered history, not the newest packet', () => {
+        const network = new FlightNetwork(() => { })
+        const handle = (bytes: Uint8Array) => (network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(bytes)
+        const clock = vi.spyOn(performance, 'now')
+        const state = (x: number, sequence: number) =>
+            new Uint8Array(encode([1, 42, sequence, [x, 0, 0, 0, 0, 0, true, 1000, false, 0, 0, false, 100]]))
+        clock.mockReturnValue(1000); handle(state(100, 1))
+        clock.mockReturnValue(1050); handle(state(200, 2))
+        clock.mockReturnValue(1100); handle(state(300, 3))
+        // The interval settles at 50 ms, so playback sits 100 ms behind: at t=1125 the render cursor
+        // is halfway between the 1000 (x=1 m) and 1050 (x=2 m) snapshots, behind the newest x=3 m.
+        const [remote] = network.remotes(1125)
+        expect(remote!.flight.x).toBeCloseTo(1.5, 6)
+        clock.mockRestore()
+    })
+
+    it('holds the playback rate steady when a datagram is dropped', () => {
+        const network = new FlightNetwork(() => { })
+        const handle = (bytes: Uint8Array) => (network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(bytes)
+        const clock = vi.spyOn(performance, 'now')
+        const state = (x: number, sequence: number) =>
+            new Uint8Array(encode([1, 42, sequence, [x, 0, 0, 0, 0, 0, true, 1000, false, 0, 0, false, 100]]))
+        clock.mockReturnValue(1000); handle(state(100, 1))
+        clock.mockReturnValue(1050); handle(state(200, 2))
+        // Sequence 3 is lost, so the next datagram arrives a full 100 ms later. That gap is a drop,
+        // not a slower sender, so the interval stays 50 ms and playback is not dragged to half speed.
+        clock.mockReturnValue(1150); handle(state(400, 4))
+        const [remote] = network.remotes(1250)
+        expect(remote!.flight.x).toBeCloseTo(4, 6)
+        clock.mockRestore()
+    })
 })
