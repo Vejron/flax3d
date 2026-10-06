@@ -158,10 +158,18 @@ export function stepFlight(
     next.yaw += steer * (config.turnRate + next.speed * config.speedTurnRate) * dt
     next.bank += (steer * -config.bankAngle - next.bank) * Math.min(1, dt * config.bankResponse)
     const previousVerticalSpeed = next.verticalSpeed
+    const powered = flapPower > 0 || controls.flap
     const glideLift = spread * Math.min(config.maxGlideLift, next.speed ** 2 * config.glideLift)
     const slowFlight = Math.max(0, Math.min(1, (config.takeoffSpeed + 4 - next.speed) / 4))
-    const sink = flapPower || controls.flap ? 0 : config.passiveSink * slowFlight
-    next.verticalSpeed = Math.min(config.maxClimbSpeed, Math.max(-config.maxDiveSpeed, next.verticalSpeed + (glideLift - config.gravity - sink) * dt))
+    // Sink only applies while the wing is idle; a working wing cancels it entirely.
+    const sink = powered ? 0 : config.passiveSink * slowFlight
+    next.verticalSpeed = Math.max(-config.maxDiveSpeed, next.verticalSpeed + (glideLift - config.gravity - sink) * dt)
+    // Lift must not push the bird above its climb cap, but releasing the wing must not snap away
+    // height already earned: the cap only bites while the vertical speed sits below it, so gravity
+    // (not a clamp) brings an over-cap powered climb back down. This is what lets a hard flap
+    // out-climb a fast glide instead of both topping out at the glide cap.
+    const climbCap = powered ? config.maxPoweredClimbSpeed : config.maxClimbSpeed
+    next.verticalSpeed = Math.min(next.verticalSpeed, Math.max(climbCap, previousVerticalSpeed))
     const averageDescentSpeed = Math.max(0, -(previousVerticalSpeed + next.verticalSpeed) / 2)
     const diveGain = next.flying ? (1 - spread) * averageDescentSpeed * config.diveAcceleration : 0
     if (next.flying) {

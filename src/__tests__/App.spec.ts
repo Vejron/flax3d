@@ -197,6 +197,25 @@ describe('flight', () => {
     expect(hard.y).toBeGreaterThan(modest.y + 8)
   })
 
+  it('lets hard flapping out-climb an unpowered glide and reach the powered cap', () => {
+    const start = { ...initialFlightState(0), y: 200, flying: true, speed: 16, verticalSpeed: 0 }
+    let flapping = start
+    let gliding = start
+    let peak = 0
+    for (let frame = 0; frame < 60; frame++) {
+      const power = frame % 6 < 2 ? 1.2 : 0
+      flapping = stepFlight(flapping, { flap: false, flapPower: power, steer: 0, spread: 1 }, 0.05, flatGround)
+      gliding = stepFlight(gliding, { flap: false, steer: 0, spread: 1 }, 0.05, flatGround)
+      peak = Math.max(peak, flapping.verticalSpeed)
+    }
+    // A working wing must beat a passive glide, and its climb cap must be the powered one: a hard
+    // flap has to be able to exceed `maxClimbSpeed`, otherwise "Flap climb cap" is a dead slider
+    // and flapping feels like it stops paying off once the glide regime is fast enough.
+    expect(flapping.y).toBeGreaterThan(gliding.y + 8)
+    expect(peak).toBeGreaterThan(flightConfig.maxClimbSpeed)
+    expect(peak).toBeLessThanOrEqual(flightConfig.maxPoweredClimbSpeed)
+  })
+
   it('turns a down-wing dive into bounded speed and spends that speed on a pull-out', () => {
     const start = { ...initialFlightState(0), y: 150, flying: true, speed: 8, verticalSpeed: -2 }
     let dive = start
