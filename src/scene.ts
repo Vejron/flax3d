@@ -5,7 +5,7 @@ import type { FlightControls, FlightState } from './flight'
 import type { RemoteFlight } from './network'
 import type { Powerup } from './powerup'
 import { terrainHeight } from './terrain'
-import { createGun, createWeaponRig, type BulletTarget, weaponConfig, writeAimFromYaw } from './weapon'
+import { assistAim, createGun, createWeaponRig, type BulletTarget, weaponConfig, writeAimFromYaw } from './weapon'
 
 /** Radius of the sphere bullets test against a bird, in metres. */
 const BIRD_HIT_RADIUS = 1.5
@@ -235,6 +235,9 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
     const remoteHealth = new Map<number, number>()
     /** Decaying hit-shake intensity per peer. */
     const remoteShake = new Map<number, number>()
+    /** Latest reported horizontal velocity per peer, in m/s, used to lead aim-assisted shots. */
+    const remoteVelocityX = new Map<number, number>()
+    const remoteVelocityZ = new Map<number, number>()
     /** Wing-beat detector per peer, so a remote downstroke plays its whoosh at the right moment. */
     const remoteFlaps = new Map<number, FlapDetector>()
     /** Wing-beat detector for the local bird. */
@@ -356,13 +359,17 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
             if ((remoteHealth.get(id) ?? 0) <= 0) continue
             let target = hitTargetPool[hitTargets.length]
             if (!target) {
-                target = { id, x: 0, y: 0, z: 0, radius: BIRD_HIT_RADIUS }
+                target = { id, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, radius: BIRD_HIT_RADIUS }
                 hitTargetPool.push(target)
             }
             target.id = id
             target.x = avatar.position.x
             target.y = avatar.position.y
             target.z = avatar.position.z
+            // Velocity is what turns the aim assist into a lead rather than a plain nudge.
+            target.vx = remoteVelocityX.get(id) ?? 0
+            target.vy = 0
+            target.vz = remoteVelocityZ.get(id) ?? 0
             hitTargets.push(target)
         }
     }
@@ -378,6 +385,8 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
                 remoteHealth.delete(id)
                 remoteShake.delete(id)
                 remoteFlaps.delete(id)
+                remoteVelocityX.delete(id)
+                remoteVelocityZ.delete(id)
             }
         }
         for (const remote of remotes) {
@@ -396,6 +405,9 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
             const lastHealth = remoteHealth.get(remote.id)
             if (lastHealth !== undefined && remote.flight.health < lastHealth) remoteShake.set(remote.id, 1)
             remoteHealth.set(remote.id, remote.flight.health)
+            // The wire carries heading and airspeed, which is all the assist needs to lead a shot.
+            remoteVelocityX.set(remote.id, Math.sin(remote.flight.yaw) * remote.flight.speed)
+            remoteVelocityZ.set(remote.id, -Math.cos(remote.flight.yaw) * remote.flight.speed)
             const peerShake = Math.max(0, (remoteShake.get(remote.id) ?? 0) - dt / REMOTE_SHAKE_TIME)
             remoteShake.set(remote.id, peerShake)
             const dying = remote.flight.health <= 0
@@ -484,13 +496,20 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         // The bird is placed before its flap whoosh is sounded, so the position is never a frame stale.
         if (localStroke !== null && !state.dead) handlers.onFlap?.(flyer.position, localStroke)
         // Fire along the bird's heading, tilted up by the gun mount; gravity provides the drop.
-        // `writeAimFromYaw` is shared with the auto-fire cone so the two axes cannot drift apart.
+        // `writeAimFromYaw` is shared with the auto-fire cone so the two axes cannot drift apart,
+        // and `assistAim` then bends the round slightly toward a rival already near the line, which
+        // is what makes gunnery workable while the pilot is flapping. Refreshed here so the assist
+        // and the hit test below read exactly the same target positions.
+        refreshHitTargets()
         gun.muzzle.getWorldPosition(reticlePosition)
-        if (fire && weapon.fire(writeAimFromYaw(state.yaw, aimDirection))) {
-            shotPoint.x = reticlePosition.x
-            shotPoint.y = reticlePosition.y
-            shotPoint.z = reticlePosition.z
-            handlers.onShot?.(shotPoint)
+        if (fire) {
+            writeAimFromYaw(state.yaw, aimDirection)
+            if (weapon.fire(assistAim(reticlePosition, aimDirection, hitTargets))) {
+                shotPoint.x = reticlePosition.x
+                shotPoint.y = reticlePosition.y
+                shotPoint.z = reticlePosition.z
+                handlers.onShot?.(shotPoint)
+            }
         }
         // Reticle marks the exact spot the next round reaches at RETICLE_RANGE metres, gravity drop
         // included, so the player can see where a shot is actually going.
@@ -502,7 +521,6 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         const style = RETICLE_STYLES[reticleTint]
         reticleMaterial.color.setHex(style.color)
         reticleMaterial.opacity = style.opacity
-        refreshHitTargets()
         for (const hit of weapon.update(dt, terrainHeight, hitTargets)) handlers.onHit?.(hit.targetId)
         for (const trail of trails) {
             if (!state.flying || state.speed < 4) {

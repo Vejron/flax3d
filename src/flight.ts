@@ -68,8 +68,14 @@ export const flightConfig = {
     deathDrag: 1.6,
     /** Length of the body-mode auto-fire lock cone, in metres. */
     autoFireRange: 60,
-    /** Half-angle of the body-mode auto-fire lock cone, in degrees. */
-    autoFireAngle: 12,
+    /**
+     * Half-angle of the body-mode auto-fire lock cone, in degrees. The cone axis is the gun axis,
+     * which is pitched up by `gunPitch` (10 degrees) to repay the round's drop, so this must clear
+     * that pitch by a wide margin: at the original 12 degrees only the top 2 degrees reached below
+     * the horizon, so a rival level with the bird locked within ~1.4 m of altitude at 40 m and
+     * anything lower never locked at all.
+     */
+    autoFireAngle: 28,
     /** Seconds the cone must be held before auto-fire opens up. */
     autoFireDwell: 0.2,
 }

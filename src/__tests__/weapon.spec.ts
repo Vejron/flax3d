@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import * as THREE from 'three'
 
-import { createBullet, createGun, createWeaponRig, gunPitch, scatter, stepBullet, terrainNormal, updateAutoFire, weaponConfig, writeAimFromYaw } from '../weapon'
+import { assistAim, createBullet, createGun, createWeaponRig, gunPitch, interceptTime, scatter, stepBullet, terrainNormal, updateAutoFire, weaponConfig, writeAimFromYaw } from '../weapon'
+import { flightConfig } from '../flight'
 
 describe('weapon ballistics', () => {
     const flat = () => 0
@@ -184,6 +185,111 @@ describe('weapon ballistics', () => {
     })
 })
 
+describe('shot spread and aim assist', () => {
+    const origin = { x: 0, y: 0, z: 0 }
+    const ahead = { x: 0, y: 0, z: -1 }
+    const radiansToDegrees = (radians: number) => (radians * 180) / Math.PI
+    const angleBetween = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => {
+        const dot = a.x * b.x + a.y * b.y + a.z * b.z
+        return Math.acos(Math.min(1, Math.max(-1, dot)))
+    }
+    /** A point `degrees` off the aim line, `distance` metres ahead. */
+    const offAxis = (degrees: number, distance = 50) => ({
+        x: Math.sin((degrees * Math.PI) / 180) * distance,
+        y: 0,
+        z: -Math.cos((degrees * Math.PI) / 180) * distance,
+    })
+    const unit = (point: { x: number; y: number; z: number }) => {
+        const length = Math.hypot(point.x, point.y, point.z) || 1
+        return { x: point.x / length, y: point.y / length, z: point.z / length }
+    }
+
+    it('scatters the shipped gun enough to miss at range', () => {
+        // Keeping gunfights from ending in one burst is the whole point of the spread: at 60 m the
+        // cone has to be wider than the 1.5 m body hit sphere (BIRD_HIT_RADIUS in `scene.ts`) or
+        // every round lands and the assist below would make it worse.
+        expect(Math.tan(weaponConfig.spread) * 60).toBeGreaterThan(1.5)
+    })
+
+    it('removes the configured fraction of the aim error', () => {
+        const error = 4
+        const target = offAxis(error)
+        const assisted = assistAim(origin, ahead, [target])
+        // The error is measured to the target, not to where the raw shot used to point.
+        const remaining = radiansToDegrees(angleBetween(assisted, unit(target)))
+        expect(remaining).toBeCloseTo(error * (1 - weaponConfig.aimAssistStrength), 1)
+        // The shot moved off the raw aim line, part of the way toward the rival.
+        expect(radiansToDegrees(angleBetween(ahead, assisted)))
+            .toBeCloseTo(error * weaponConfig.aimAssistStrength, 1)
+        expect(assisted.x).toBeGreaterThan(0)
+    })
+
+    it('leaves the shot alone with no rival worth helping with', () => {
+        expect(assistAim(origin, ahead, [])).toEqual(ahead)
+        // Wider of the axis than the assist looks.
+        expect(assistAim(origin, ahead, [offAxis(weaponConfig.aimAssistCone + 6)])).toEqual(ahead)
+        // Past the assist range.
+        expect(assistAim(origin, ahead, [{ x: 0, y: 0, z: -(weaponConfig.aimAssistRange + 10) }])).toEqual(ahead)
+        // Behind the bird.
+        expect(assistAim(origin, ahead, [{ x: 0, y: 0, z: 20 }])).toEqual(ahead)
+    })
+
+    it('never bends past the rival it is helping aim at', () => {
+        const target = offAxis(3.5, 30)
+        const maxed = assistAim(origin, ahead, [target], { ...weaponConfig, aimAssistStrength: 4 })
+        const toTarget = unit(target)
+        expect(maxed.x).toBeCloseTo(toTarget.x, 6)
+        expect(maxed.z).toBeCloseTo(toTarget.z, 6)
+    })
+
+    it('prefers the rival closest to the line of fire', () => {
+        const closer = offAxis(3, 40)
+        const wider = offAxis(-4.5, 40)
+        expect(assistAim(origin, ahead, [wider, closer]).x).toBeGreaterThan(0)
+        expect(assistAim(origin, ahead, [closer, wider]).x).toBeGreaterThan(0)
+    })
+
+    it('is inert when the strength is zero', () => {
+        expect(assistAim(origin, ahead, [offAxis(4)], { ...weaponConfig, aimAssistStrength: 0 })).toEqual(ahead)
+    })
+
+    it('solves the intercept time for a moving rival', () => {
+        // Straight ahead and still: just the distance over the muzzle speed.
+        expect(interceptTime({ x: 0, y: 0, z: -55 }, { x: 0, y: 0, z: 0 }, weaponConfig.speed)).toBeCloseTo(1, 6)
+        // Crossing at 20 m/s from 30 m out: the classic lead quadratic, ~0.586 s.
+        expect(interceptTime({ x: 0, y: 0, z: -30 }, { x: 20, y: 0, z: 0 }, weaponConfig.speed)).toBeCloseTo(0.5855, 3)
+        // Outrunning the round leaves no intercept at all.
+        expect(interceptTime({ x: 0, y: 0, z: -30 }, { x: 0, y: 0, z: -100 }, weaponConfig.speed)).toBeNull()
+    })
+
+    it('leads a crossing rival by the full flight time', () => {
+        const crossing = { x: 0, y: 0, z: -30, vx: 20, vy: 0, vz: 0 }
+        const assisted = assistAim(origin, ahead, [crossing], { ...weaponConfig, aimAssistStrength: 1 })
+        const flight = interceptTime({ x: 0, y: 0, z: -30 }, { x: 20, y: 0, z: 0 }, weaponConfig.speed)!
+        const leadPoint = unit({ x: 20 * flight, y: 0, z: -30 })
+        expect(radiansToDegrees(angleBetween(assisted, leadPoint))).toBeCloseTo(0, 4)
+        // Aimed ahead of the bird, on the side it is travelling toward, not at where it is now.
+        expect(assisted.x).toBeGreaterThan(0.3)
+    })
+
+    it('forgives aim error without giving the lead away', () => {
+        const error = 4
+        const crossing = { ...offAxis(error), vx: 20, vy: 0, vz: 0 }
+        const assisted = assistAim(origin, ahead, [crossing])
+        const flight = interceptTime(offAxis(error), { x: 20, y: 0, z: 0 }, weaponConfig.speed)!
+        const leadPoint = unit({ x: offAxis(error).x + 20 * flight, y: 0, z: offAxis(error).z })
+        // The residual is exactly the un-forgiven slice of the aim error, with the lead intact.
+        expect(radiansToDegrees(angleBetween(assisted, leadPoint)))
+            .toBeCloseTo(error * (1 - weaponConfig.aimAssistStrength), 1)
+    })
+
+    it('adds no lead to a rival that is not moving', () => {
+        const assisted = assistAim(origin, ahead, [offAxis(3)])
+        const nudged = radiansToDegrees(angleBetween(ahead, assisted))
+        expect(nudged).toBeCloseTo(3 * weaponConfig.aimAssistStrength, 1)
+    })
+})
+
 describe('weapon magazine', () => {
     const flat = () => 0
     const aim = new THREE.Vector3(0, 0, -1)
@@ -246,9 +352,10 @@ describe('weapon magazine', () => {
 })
 
 describe('auto-fire cone', () => {
-    // Match the shipped Combat-group defaults: 60 m of reach, a 12° half-angle, 0.2 s of dwell.
-    const halfAngle = (12 * Math.PI) / 180
-    const options = { range: 60, halfAngle, dwell: 0.2 }
+    // Read the shipped defaults straight from the config so a retune cannot leave this suite
+    // testing a cone the game no longer ships — which is how an unusable default slipped through.
+    const halfAngle = (flightConfig.autoFireAngle * Math.PI) / 180
+    const options = { range: flightConfig.autoFireRange, halfAngle, dwell: flightConfig.autoFireDwell }
     const origin = { x: 0, y: 0, z: 0 }
     /** A point `distance` metres along an axis pitched `pitch` above the horizon, dead ahead. */
     const along = (pitch: number, distance: number) => ({
@@ -281,6 +388,18 @@ describe('auto-fire cone', () => {
         const outside = along(gunPitch + halfAngle * 1.5, 35)
         expect(updateAutoFire(0, 0.05, origin, 0, [inside], options).locked).toBe(true)
         expect(updateAutoFire(0, 0.05, origin, 0, [outside], options).locked).toBe(false)
+    })
+
+    it('leaves a usable window below the bird, not just above it', () => {
+        // The cone axis is pitched up by `gunPitch`, so a half-angle that barely exceeds that pitch
+        // makes the gate one-sided: a rival level with the bird squeaks in, one slightly lower is
+        // invisible. These two cases pin the shipped default as usable in both directions.
+        const below = { x: 0, y: -10, z: -Math.sqrt(50 ** 2 - 10 ** 2) }
+        const above = { x: 0, y: 20, z: -Math.sqrt(50 ** 2 - 20 ** 2) }
+        expect(updateAutoFire(0, 0.05, origin, 0, [below], options).locked).toBe(true)
+        expect(updateAutoFire(0, 0.05, origin, 0, [above], options).locked).toBe(true)
+        // Still no lock on a rival behind the bird.
+        expect(updateAutoFire(0, 0.05, origin, 0, [{ x: 0, y: -10, z: 48 }], options).locked).toBe(false)
     })
 
     it('opens fire only after the cone is held for the dwell, and resets when it is lost', () => {

@@ -25,8 +25,22 @@ export const weaponConfig = {
     gravity: 24,
     /** Seconds a bullet stays alive before it is recycled. */
     life: 4,
-    /** Aim scatter half-angle in radians. */
-    spread: 0.006,
+    /**
+     * Aim scatter half-angle in radians. This is the "you cannot just hold the trigger" dial: at
+     * 0.05 rad (~2.9 degrees) a round can wander about 1.5 m at 30 m and 2.9 m at 60 m, so a burst
+     * lands a fraction of its shots instead of sawing a rival in half in one pass.
+     */
+    spread: 0.05,
+    /**
+     * Soft aim assist, in degrees: the widest angular error that still attracts a shot toward a
+     * rival. Paired with `aimAssistStrength` it sharpens a near miss without ever flying the bullet
+     * for the player, so the spread above still decides each individual round.
+     */
+    aimAssistCone: 5,
+    /** Metres within which a rival can attract aim assist. */
+    aimAssistRange: 70,
+    /** Fraction of the aiming error the assist removes, `0..1`. Kept partial so it stays soft. */
+    aimAssistStrength: 0.6,
     /** Seconds between shots while the trigger is held. */
     fireInterval: 0.11,
     /** Hard cap on live bullets; the pool never grows past this. */
@@ -64,12 +78,20 @@ export interface BulletImpact {
     speed: number
 }
 
-/** A bird that bullets owned by the local shooter can hit. */
-export interface BulletTarget {
-    id: number
+/** A point aim assist can attract a shot toward. */
+export interface AimTarget {
     x: number
     y: number
     z: number
+    /** Velocity in m/s when known; the assist leads the shot to where the target will be. */
+    vx?: number
+    vy?: number
+    vz?: number
+}
+
+/** A bird that bullets owned by the local shooter can hit. */
+export interface BulletTarget extends AimTarget {
+    id: number
     radius: number
 }
 
@@ -119,6 +141,136 @@ export function scatter(direction: Vec3, spread: number, random: () => number = 
     const tangent = Math.hypot(ox, oy, oz) || 1
     const angle = spread * random()
     return { x: x + (ox / tangent) * angle, y: y + (oy / tangent) * angle, z: z + (oz / tangent) * angle }
+}
+
+/**
+ * Flight time for a round of `speed` m/s to intercept a target `p` metres away from the muzzle that
+ * is moving at constant velocity `v`, solving `|p + v·t| = speed·t`. Returns the earliest positive
+ * root, or `null` when the target outruns the round so no intercept exists.
+ */
+export function interceptTime(p: Vec3, v: Vec3, speed: number): number | null {
+    const a = v.x * v.x + v.y * v.y + v.z * v.z - speed * speed
+    const b = 2 * (p.x * v.x + p.y * v.y + p.z * v.z)
+    const c = p.x * p.x + p.y * p.y + p.z * p.z
+    const roots: number[] = []
+    if (Math.abs(a) < 1e-9) {
+        // Matched speeds collapse the quadratic to a straight line.
+        if (Math.abs(b) > 1e-9) roots.push(-c / b)
+    } else {
+        const discriminant = b * b - 4 * a * c
+        if (discriminant < 0) return null
+        const root = Math.sqrt(discriminant)
+        roots.push((-b - root) / (2 * a), (-b + root) / (2 * a))
+    }
+    let soonest = Infinity
+    for (const t of roots) if (t > 0 && t < soonest) soonest = t
+    return Number.isFinite(soonest) ? soonest : null
+}
+
+/** Unit vector in the direction `(x, y, z)`. */
+function unit(x: number, y: number, z: number): Vec3 {
+    const length = Math.hypot(x, y, z) || 1
+    return { x: x / length, y: y / length, z: z / length }
+}
+
+/** Cross product of two plain vectors. */
+function cross(a: Vec3, b: Vec3): Vec3 {
+    return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x }
+}
+
+/** Spherical interpolation from unit `a` to unit `b` by `t`, so `t` is the exact fraction moved. */
+function slerpDirection(a: Vec3, b: Vec3, t: number): Vec3 {
+    const cos = Math.min(1, Math.max(-1, a.x * b.x + a.y * b.y + a.z * b.z))
+    const angle = Math.acos(cos)
+    const sinAngle = Math.sin(angle)
+    if (sinAngle < 1e-6) return { x: b.x, y: b.y, z: b.z }
+    const from = Math.sin((1 - t) * angle) / sinAngle
+    const to = Math.sin(t * angle) / sinAngle
+    return unit(a.x * from + b.x * to, a.y * from + b.y * to, a.z * from + b.z * to)
+}
+
+/** Rotates unit `v` about unit `axis` by `angle` radians (Rodrigues' rotation formula). */
+function rotateAbout(v: Vec3, axis: Vec3, angle: number): Vec3 {
+    const cos = Math.cos(angle)
+    const sin = Math.sin(angle)
+    const kxv = cross(axis, v)
+    const along = axis.x * v.x + axis.y * v.y + axis.z * v.z
+    const scale = along * (1 - cos)
+    return unit(
+        v.x * cos + kxv.x * sin + axis.x * scale,
+        v.y * cos + kxv.y * sin + axis.y * scale,
+        v.z * cos + kxv.z * sin + axis.z * scale,
+    )
+}
+
+/**
+ * Soft aim assist. If the rival nearest the line of fire sits within `aimAssistCone` degrees and
+ * `aimAssistRange` metres, the shot is swung `aimAssistStrength` of the way onto it and then led in
+ * full to where that rival will be when the round arrives.
+ *
+ * The two halves are deliberately separate. The aim forgiveness is partial, so the player still has
+ * to point at the rival; the lead is total, because a crossing bird at 20 m/s travels many metres
+ * during the round's flight and a partial lead would just miss anyway. Gravity and `scatter` still
+ * apply on top, so even a led shot is not a guaranteed hit. A rival behind the bird, out of range,
+ * or wider of the axis than the cone is ignored entirely.
+ */
+export function assistAim(
+    origin: Vec3,
+    direction: Vec3,
+    targets: readonly AimTarget[],
+    config: WeaponConfig = weaponConfig,
+): Vec3 {
+    const length = Math.hypot(direction.x, direction.y, direction.z) || 1
+    const raw: Vec3 = { x: direction.x / length, y: direction.y / length, z: direction.z / length }
+    const strength = Math.min(1, Math.max(0, config.aimAssistStrength))
+    if (strength === 0 || targets.length === 0) return raw
+
+    const cosLimit = Math.cos((config.aimAssistCone * Math.PI) / 180)
+    const rangeSquared = config.aimAssistRange * config.aimAssistRange
+    let bestCos = cosLimit
+    let rx = 0
+    let ry = 0
+    let rz = 0
+    let vx = 0
+    let vy = 0
+    let vz = 0
+    for (const target of targets) {
+        const tx = target.x - origin.x
+        const ty = target.y - origin.y
+        const tz = target.z - origin.z
+        const distanceSquared = tx * tx + ty * ty + tz * tz
+        if (distanceSquared === 0 || distanceSquared > rangeSquared) continue
+        const distance = Math.sqrt(distanceSquared)
+        const cos = (raw.x * tx + raw.y * ty + raw.z * tz) / distance
+        // Only the rival closest to the line of fire attracts the shot, so the help never jumps
+        // between targets mid-burst.
+        if (cos <= bestCos) continue
+        bestCos = cos
+        rx = tx
+        ry = ty
+        rz = tz
+        vx = target.vx ?? 0
+        vy = target.vy ?? 0
+        vz = target.vz ?? 0
+    }
+    if (bestCos <= cosLimit) return raw
+
+    // Forgive `strength` of the aiming error. Slerp, so the fraction really is exact.
+    let aim = slerpDirection(raw, unit(rx, ry, rz), strength)
+
+    // Then lead in full: rotate by the angle separating "where it is" from "where it will be".
+    // Rotating (rather than re-blending toward the lead point) keeps the forgiveness above intact;
+    // blending would scale the lead down and leave a crossing target untouched.
+    const flight = interceptTime({ x: rx, y: ry, z: rz }, { x: vx, y: vy, z: vz }, config.speed)
+    if (flight === null || flight <= 0) return aim
+    const toNow = unit(rx, ry, rz)
+    const toLead = unit(rx + vx * flight, ry + vy * flight, rz + vz * flight)
+    const axis = cross(toNow, toLead)
+    const axisLength = Math.hypot(axis.x, axis.y, axis.z)
+    if (axisLength < 1e-9) return aim
+    const leadAngle = Math.atan2(axisLength, toNow.x * toLead.x + toNow.y * toLead.y + toNow.z * toLead.z)
+    aim = rotateAbout(aim, { x: axis.x / axisLength, y: axis.y / axisLength, z: axis.z / axisLength }, leadAngle)
+    return aim
 }
 
 /** Terrain surface normal from finite differences of the height field. */
@@ -373,7 +525,7 @@ export interface WeaponRig {
      * Fires one round if that shooter's trigger has cooled down. `origin` defaults to the local
      * muzzle, so remote callers pass their own muzzle position and network id.
      */
-    fire: (direction: THREE.Vector3, origin?: THREE.Vector3, shooter?: number) => boolean
+    fire: (direction: Vec3, origin?: THREE.Vector3, shooter?: number) => boolean
     /**
      * Integrates bullets, refreshes tracers, and ages the impact effects. Only rounds owned by the
      * local shooter test `targets`. The returned array is reused until the next call, so read it now.
@@ -527,7 +679,7 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D, even
         }
     }
 
-    function fire(direction: THREE.Vector3, origin?: THREE.Vector3, shooter = LOCAL_SHOOTER) {
+    function fire(direction: Vec3, origin?: THREE.Vector3, shooter = LOCAL_SHOOTER) {
         if ((cooldowns.get(shooter) ?? 0) > 0) return false
         // Only the local shooter draws from the magazine; a peer's rounds are decorative replays, so
         // gating here is what guarantees the wire `fire` flag never claims a shot the gun never made.
