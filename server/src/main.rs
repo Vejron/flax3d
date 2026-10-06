@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration as StdDuration, Instant},
+    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncWriteExt;
@@ -27,6 +27,20 @@ const MESSAGE_VERSION: u8 = 5;
 const MESSAGE_HIT: u8 = 0;
 /// Tag for a client's latency probe (`[1, nonce]`), which the server echoes back as a `pong`.
 const MESSAGE_PING: u8 = 1;
+/// Tag for a client's pickup report (`[2, slot]`), which the server validates and rebroadcasts.
+const MESSAGE_PICKUP: u8 = 2;
+/// Power-up slots kept on the field. One reappears `POWERUP_RESPAWN` after it is collected.
+const POWERUP_SLOTS: usize = 2;
+/// Horizontal radius of the random spawn disc around the origin, in metres.
+const POWERUP_SPAWN_RADIUS_M: f64 = 300.0;
+/// Lowest and highest spawn altitude above the terrain, in metres.
+const POWERUP_MIN_ALTITUDE_M: f64 = 13.0;
+const POWERUP_MAX_ALTITUDE_M: f64 = 80.0;
+/// Delay between a slot being collected and reappearing, mirroring `powerupConfig.respawnSeconds`.
+const POWERUP_RESPAWN: StdDuration = StdDuration::from_secs(10);
+/// Sphere a pickup is accepted within, in centimetres. Covers the client's 4 m reach plus the
+/// staleness of a 20 Hz position update during a fast pass, so a fair pickup is never rejected.
+const PICKUP_REACH_CM: f64 = 800.0;
 
 /// Fixed-point wire position. Units mirror `src/network.ts` and are documented in NETWORKING.md.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -109,6 +123,10 @@ enum EventKind {
     State,
     Leave,
     Hit,
+    /// A power-up appeared (or reappeared) at a world position.
+    PowerupSpawn,
+    /// A player collected a power-up.
+    PowerupTaken,
 }
 
 impl Event {
@@ -129,6 +147,18 @@ impl Event {
         Self::encode(EventKind::Hit, id, &(EVENT_HIT, id, victim))
     }
 
+    /// A power-up appearing at a world position (centimetres). Global rather than player-scoped, so
+    /// `id` is 0 — never a real player id — and the sender filter can never suppress it.
+    fn powerup_spawn(slot: u8, x: i32, y: i32, z: i32) -> Result<Self, salvo::Error> {
+        Self::encode(EventKind::PowerupSpawn, 0, &(EVENT_POWERUP_SPAWN, slot, x, y, z))
+    }
+
+    /// `taker` collected power-up `slot`. Keeps `id = taker` so the collector receives it too and
+    /// can credit its own magazine, while everyone else simply clears the pickup from the field.
+    fn powerup_taken(slot: u8, taker: u64) -> Result<Self, salvo::Error> {
+        Self::encode(EventKind::PowerupTaken, taker, &(EVENT_POWERUP_TAKEN, slot, taker))
+    }
+
     fn encode(kind: EventKind, id: u64, value: &impl Serialize) -> Result<Self, salvo::Error> {
         let bytes = rmp_serde::to_vec(value).map_err(salvo::Error::other)?;
         Ok(Self { kind, id, bytes: Bytes::from(bytes) })
@@ -140,6 +170,8 @@ const EVENT_STATE: u8 = 1;
 const EVENT_LEAVE: u8 = 2;
 const EVENT_HIT: u8 = 3;
 const EVENT_PONG: u8 = 4;
+const EVENT_POWERUP_SPAWN: u8 = 5;
+const EVENT_POWERUP_TAKEN: u8 = 6;
 
 #[derive(Clone)]
 struct Player {
@@ -147,10 +179,79 @@ struct Player {
     position: Position,
 }
 
+/// One power-up slot. `respawn_at` is only meaningful while `active` is false.
+#[derive(Clone, Copy)]
+struct PowerupSlot {
+    active: bool,
+    x: i32,
+    y: i32,
+    z: i32,
+    respawn_at: Option<Instant>,
+}
+
+/// Tiny xorshift64* generator. Dependency-free on purpose: adding `rand` (or the `tokio` `time`
+/// feature for a respawn timer) would invalidate the Docker dependency layer for no benefit.
+struct Rng(u64);
+
+impl Rng {
+    fn from_seed(seed: u64) -> Self {
+        // A zero state would be a fixed point, so force it non-zero.
+        Self(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in `[0, 1)`.
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn range(&mut self, low: f64, high: f64) -> f64 {
+        low + self.next_f64() * (high - low)
+    }
+}
+
+/// Terrain height in metres, mirroring `terrainHeight` in `src/terrain.ts`. The client renders the
+/// same field, so the two formulas must stay in step; `terrain_height_matches_the_client` pins it.
+fn terrain_height(x: f64, z: f64) -> f64 {
+    let rolling = ((z + 80.0) * 0.018).cos() - (80.0_f64 * 0.018).cos();
+    let rolling = rolling * (x * 0.012).cos() * 15.0;
+    let crossing = (x * 0.014).sin() * (z * 0.012).cos() * 11.0;
+    let detail = (z * 0.041 + x * 0.013).sin() * 2.3;
+    let distance = (x.hypot(z) / 40.0).min(1.0);
+    (rolling + crossing + detail) * (0.15 + 0.85 * distance * distance)
+}
+
+/// Picks a fresh power-up position: a uniform point in the spawn disc, 13..80 m above the terrain.
+fn random_powerup(rng: &mut Rng) -> (i32, i32, i32) {
+    // Square-rooting the radius spreads points evenly over the area instead of clumping at the hub.
+    let angle = rng.range(0.0, std::f64::consts::TAU);
+    let radius = POWERUP_SPAWN_RADIUS_M * rng.next_f64().sqrt();
+    let x = angle.cos() * radius;
+    let z = angle.sin() * radius;
+    let y = terrain_height(x, z) + rng.range(POWERUP_MIN_ALTITUDE_M, POWERUP_MAX_ALTITUDE_M);
+    (
+        (x * 100.0).round() as i32,
+        (y * 100.0).round() as i32,
+        (z * 100.0).round() as i32,
+    )
+}
+
 struct Room {
     next_id: AtomicU64,
     players: Mutex<HashMap<u64, Player>>,
     events: broadcast::Sender<Event>,
+    /// The power-up field. The server owns where each slot sits and when it comes back.
+    powerups: Mutex<[PowerupSlot; POWERUP_SLOTS]>,
+    /// Shared spawn-position generator (see `Rng`).
+    rng: Mutex<Rng>,
 }
 
 struct PlayerGuard {
@@ -170,11 +271,76 @@ impl Drop for PlayerGuard {
 impl Room {
     fn new() -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15);
+        let mut rng = Rng::from_seed(seed);
+        // Both slots start on the field, so the match opens with two pickups available.
+        let powerups = std::array::from_fn(|_| {
+            let (x, y, z) = random_powerup(&mut rng);
+            PowerupSlot { active: true, x, y, z, respawn_at: None }
+        });
         Arc::new(Self {
             next_id: AtomicU64::new(1),
             players: Mutex::new(HashMap::new()),
             events,
+            powerups: Mutex::new(powerups),
+            rng: Mutex::new(rng),
         })
+    }
+}
+
+/// Applies a pickup claim: true when `slot` is active and `player` is within reach, in which case
+/// the slot is cleared and armed for respawn. The first valid claim wins, so a racing peer's later
+/// report finds the slot inactive and is refused.
+fn claim_powerup(room: &Room, slot: usize, player: &Player) -> bool {
+    // A player that has not sent an update yet still sits at the default position and must not
+    // collect whatever happens to be near it.
+    if player.sequence == 0 || slot >= POWERUP_SLOTS {
+        return false;
+    }
+    let mut powerups = room.powerups.lock().unwrap();
+    let entry = &mut powerups[slot];
+    if !entry.active {
+        return false;
+    }
+    let dx = (entry.x - player.position.x) as f64;
+    let dy = (entry.y - player.position.y) as f64;
+    let dz = (entry.z - player.position.z) as f64;
+    if dx * dx + dy * dy + dz * dz > PICKUP_REACH_CM * PICKUP_REACH_CM {
+        return false;
+    }
+    entry.active = false;
+    entry.respawn_at = Some(Instant::now() + POWERUP_RESPAWN);
+    true
+}
+
+/// Brings any expired slot back at a fresh position and tells everyone. Called from the update path
+/// rather than a timer, so the server needs no background task and no `tokio` `time` feature.
+fn sweep_powerups(room: &Room) {
+    let mut rng = room.rng.lock().unwrap();
+    let mut powerups = room.powerups.lock().unwrap();
+    for index in 0..POWERUP_SLOTS {
+        let slot = &mut powerups[index];
+        if slot.active {
+            continue;
+        }
+        // Compare forwards (`now >= deadline`) rather than calling `elapsed()`, which would panic
+        // on an instant that is still in the future.
+        match slot.respawn_at {
+            Some(deadline) if Instant::now() >= deadline => {}
+            _ => continue,
+        }
+        let (x, y, z) = random_powerup(&mut rng);
+        slot.active = true;
+        slot.x = x;
+        slot.y = y;
+        slot.z = z;
+        slot.respawn_at = None;
+        if let Ok(event) = Event::powerup_spawn(index as u8, x, y, z) {
+            let _ = room.events.send(event);
+        }
     }
 }
 
@@ -269,9 +435,25 @@ impl Relay {
             stream.write_all(&event.bytes).await?;
             stream.shutdown().await?;
         }
+        // A newcomer also needs the current power-up field, since spawn events only fire on change.
+        let powerup_snapshot = {
+            let powerups = room.powerups.lock().unwrap();
+            powerups
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.active)
+                .map(|(index, slot)| Event::powerup_spawn(index as u8, slot.x, slot.y, slot.z))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for event in &powerup_snapshot {
+            let mut stream = session.open_uni(session_id).await?;
+            stream.write_all(&event.bytes).await?;
+            stream.shutdown().await?;
+        }
         let mut last_update = Instant::now() - StdDuration::from_secs(1);
         let mut last_hit = Instant::now() - StdDuration::from_secs(1);
         let mut last_ping = Instant::now() - StdDuration::from_secs(1);
+        let mut last_pickup = Instant::now() - StdDuration::from_secs(1);
         loop {
             tokio::select! {
                 incoming = reader.read_datagram() => {
@@ -290,6 +472,8 @@ impl Relay {
                         }
                         last_update = Instant::now();
                         let _ = room.events.send(Event::state(id, update.1, update.2)?);
+                        // Piggyback the respawn schedule on the update stream, so no timer is needed.
+                        sweep_powerups(room);
                     } else if let Ok((tag, value)) = rmp_serde::from_slice::<(u8, u64)>(&payload) {
                         // Both control messages are two-element `[tag, value]` arrays, so they share
                         // a decode and are told apart by tag. Each gets its own throttle rather than
@@ -307,6 +491,20 @@ impl Relay {
                             last_ping = Instant::now();
                             let pong = rmp_serde::to_vec(&(EVENT_PONG, value)).map_err(salvo::Error::other)?;
                             if sender.send_datagram(Bytes::from(pong)).is_err() { break; }
+                        } else if tag == MESSAGE_PICKUP {
+                            if last_pickup.elapsed() < StdDuration::from_millis(25) { continue; }
+                            last_pickup = Instant::now();
+                            let Some(index) = usize::try_from(value).ok().filter(|slot| *slot < POWERUP_SLOTS) else { continue };
+                            // Validate the claim against the sender's last known position, so a
+                            // client cannot collect a power-up it is nowhere near.
+                            let player = {
+                                let players = room.players.lock().unwrap();
+                                players.get(&id).cloned()
+                            };
+                            let Some(player) = player else { break };
+                            if claim_powerup(room, index, &player) {
+                                let _ = room.events.send(Event::powerup_taken(index as u8, id)?);
+                            }
                         }
                     }
                 }
@@ -492,6 +690,99 @@ mod tests {
     }
 
     #[test]
+    fn encodes_powerup_events() {
+        let spawn = Event::powerup_spawn(1, 1_200, 4_500, -300).unwrap().bytes;
+        let (kind, slot, x, y, z) =
+            rmp_serde::from_slice::<(u8, u8, i32, i32, i32)>(&spawn).unwrap();
+        assert_eq!((kind, slot), (EVENT_POWERUP_SPAWN, 1));
+        assert_eq!((x, y, z), (1_200, 4_500, -300));
+        assert!(spawn.len() < 32);
+
+        let taken = Event::powerup_taken(0, 7).unwrap().bytes;
+        let (kind, slot, taker) = rmp_serde::from_slice::<(u8, u8, u64)>(&taken).unwrap();
+        assert_eq!((kind, slot, taker), (EVENT_POWERUP_TAKEN, 0, 7));
+        assert!(taken.len() < 16);
+    }
+
+    /// Pins the Rust terrain formula to the values `src/terrain.ts` produces for the same inputs.
+    #[test]
+    fn terrain_height_matches_the_client() {
+        let cases = [
+            (0.0, 0.0, 0.0),
+            (120.0, -250.0, -14.572_022_318),
+            (-300.0, 150.0, 8.651_512_009),
+            (42.5, 88.25, -13.666_161_979),
+        ];
+        for (x, z, expected) in cases {
+            assert!(
+                (terrain_height(x, z) - expected).abs() < 1e-6,
+                "terrain_height({x}, {z}) drifted from the client formula"
+            );
+        }
+    }
+
+    #[test]
+    fn powerup_spawns_stay_over_the_area() {
+        let mut rng = Rng::from_seed(12_345);
+        for _ in 0..500 {
+            let (x, y, z) = random_powerup(&mut rng);
+            let (xm, zm) = (f64::from(x) / 100.0, f64::from(z) / 100.0);
+            assert!(xm.hypot(zm) <= POWERUP_SPAWN_RADIUS_M + 0.5);
+            let altitude = f64::from(y) / 100.0 - terrain_height(xm, zm);
+            assert!(
+                (POWERUP_MIN_ALTITUDE_M - 0.5..=POWERUP_MAX_ALTITUDE_M + 0.5).contains(&altitude),
+                "altitude {altitude} m is outside the 13..80 m band"
+            );
+        }
+    }
+
+    #[test]
+    fn a_taken_slot_respawns_only_once_its_delay_has_passed() {
+        let room = Room::new();
+        assert!(room.powerups.lock().unwrap().iter().all(|slot| slot.active));
+        {
+            let mut powerups = room.powerups.lock().unwrap();
+            powerups[0].active = false;
+            powerups[0].respawn_at = Some(Instant::now() + POWERUP_RESPAWN);
+        }
+        sweep_powerups(&room);
+        assert!(!room.powerups.lock().unwrap()[0].active, "a slot reappeared before its delay");
+
+        {
+            let mut powerups = room.powerups.lock().unwrap();
+            powerups[0].respawn_at = Some(Instant::now() - StdDuration::from_millis(1));
+        }
+        sweep_powerups(&room);
+        let powerups = room.powerups.lock().unwrap();
+        assert!(powerups[0].active, "a due slot did not come back");
+        assert!(powerups[0].respawn_at.is_none());
+    }
+
+    #[test]
+    fn pickup_claims_need_an_active_slot_and_a_nearby_player() {
+        let room = Room::new();
+        let at = |x: i32, y: i32, z: i32, sequence: u32| Player {
+            sequence,
+            position: Position { x, y, z, ..Position::default() },
+        };
+        let (x, y, z) = {
+            let powerups = room.powerups.lock().unwrap();
+            (powerups[0].x, powerups[0].y, powerups[0].z)
+        };
+
+        // A player that has not reported a position yet cannot collect anything.
+        assert!(!claim_powerup(&room, 0, &at(x, y, z, 0)));
+        // A player right on the pickup wins it.
+        assert!(claim_powerup(&room, 0, &at(x, y, z, 1)));
+        // The slot is now inactive, so a racing peer's claim is refused rather than double-paid.
+        assert!(!claim_powerup(&room, 0, &at(x, y, z, 1)));
+        // Even an active slot is out of reach from far away.
+        assert!(!claim_powerup(&room, 1, &at(x + 5_000, y, z, 1)));
+        // And a slot index past the end is refused instead of panicking.
+        assert!(!claim_powerup(&room, POWERUP_SLOTS, &at(x, y, z, 1)));
+    }
+
+    #[test]
     fn hit_reports_and_position_updates_decode_apart() {
         let hit = rmp_serde::to_vec(&(MESSAGE_HIT, 9u64)).unwrap();
         assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&hit).unwrap(), (MESSAGE_HIT, 9));
@@ -501,6 +792,11 @@ mod tests {
         let ping = rmp_serde::to_vec(&(MESSAGE_PING, 3u64)).unwrap();
         assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&ping).unwrap(), (MESSAGE_PING, 3));
         assert!(rmp_serde::from_slice::<Update>(&ping).is_err());
+
+        // A pickup report is the same two-field shape again, told apart only by the tag.
+        let pickup = rmp_serde::to_vec(&(MESSAGE_PICKUP, 1u64)).unwrap();
+        assert_eq!(rmp_serde::from_slice::<(u8, u64)>(&pickup).unwrap(), (MESSAGE_PICKUP, 1));
+        assert!(rmp_serde::from_slice::<Update>(&pickup).is_err());
 
         let update = rmp_serde::to_vec(&(MESSAGE_VERSION, 1u32, Position::default())).unwrap();
         assert!(rmp_serde::from_slice::<Update>(&update).is_ok());

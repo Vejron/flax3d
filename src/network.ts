@@ -1,5 +1,6 @@
 import { decode, encode } from '@msgpack/msgpack'
 import type { FlightControls, FlightState } from './flight'
+import type { Powerup } from './powerup'
 
 export interface RemoteFlight {
     id: number
@@ -49,12 +50,18 @@ const FIRE_REPEAT_UPDATES = 3
 const MESSAGE_HIT = 0
 /** Tag for a client's latency probe: `[1, nonce]`, echoed back by the server as a pong. */
 const MESSAGE_PING = 1
+/** Tag for a client's pickup report: `[2, slot]`, validated and rebroadcast by the server. */
+const MESSAGE_PICKUP = 2
 
 const EVENT_WELCOME = 0
 const EVENT_STATE = 1
 const EVENT_LEAVE = 2
 const EVENT_HIT = 3
 const EVENT_PONG = 4
+/** A power-up appeared (or reappeared) at a world position, in centimetres. */
+const EVENT_POWERUP_SPAWN = 5
+/** A power-up was collected; `taker` is the player id that got it. */
+const EVENT_POWERUP_TAKEN = 6
 
 const quantize = (value: number, scale: number) => (Number.isFinite(value) ? Math.round(value * scale) : 0)
 
@@ -132,6 +139,10 @@ export class FlightNetwork {
     private pingNonce = 0
     private pendingPing: { nonce: number; sentAt: number } | null = null
     private latency: number | null = null
+    /** Live power-ups by slot id, in metres; the server owns their positions and lifecycle. */
+    private powerupField = new Map<number, Powerup>()
+    /** Slots this client collected since the last drain; only the taker credits ammo. */
+    private selfPickups: number[] = []
 
     constructor(private onStatus: (status: 'CONNECTED' | 'SOLO') => void) { }
 
@@ -217,6 +228,18 @@ export class FlightNetwork {
                 this.latency = this.latency === null ? rtt : this.latency * (1 - LATENCY_SMOOTHING) + rtt * LATENCY_SMOOTHING
                 this.pendingPing = null
             }
+        } else if (message[0] === EVENT_POWERUP_SPAWN && message.length === 5) {
+            const [slot, x, y, z] = [message[1], message[2], message[3], message[4]]
+            if (![slot, x, y, z].every((value) => typeof value === 'number' && Number.isFinite(value))) return
+            const id = slot as number
+            this.powerupField.set(id, { slot: id, x: (x as number) / CM, y: (y as number) / CM, z: (z as number) / CM })
+        } else if (message[0] === EVENT_POWERUP_TAKEN && message.length === 3) {
+            const slot = message[1]
+            const taker = message[2]
+            if (!Number.isSafeInteger(slot) || !Number.isSafeInteger(taker)) return
+            this.powerupField.delete(slot as number)
+            // Everyone clears the pickup from the field; only the taker gains the rounds.
+            if (taker === this.id) this.selfPickups.push(slot as number)
         } else if (message[0] === EVENT_STATE && message.length === 4) {
             const id = message[1]
             const sequence = message[2]
@@ -288,6 +311,28 @@ export class FlightNetwork {
         return received
     }
 
+    /**
+     * Reports flying into power-up `slot`. The server validates the claim and rebroadcasts a
+     * `taken` event, so the pickup only lands (and only credits ammo) once it is confirmed.
+     */
+    reportPickup(slot: number) {
+        if (!this.writer || !Number.isSafeInteger(slot) || slot < 0) return
+        void this.writer.write(encode([MESSAGE_PICKUP, slot])).catch(() => this.disconnect())
+    }
+
+    /** Live power-ups on the field, in metres. A fresh array, so the caller may keep it. */
+    powerups(): Powerup[] {
+        return [...this.powerupField.values()]
+    }
+
+    /** Slots this client collected since the last call; the caller adds the rounds. */
+    takePickups(): number[] {
+        if (!this.selfPickups.length) return []
+        const taken = this.selfPickups
+        this.selfPickups = []
+        return taken
+    }
+
     /** Smoothed round-trip time to the server in whole milliseconds, or null before the first pong. */
     get latencyMs(): number | null {
         return this.latency === null ? null : Math.round(this.latency)
@@ -334,6 +379,8 @@ export class FlightNetwork {
     private disconnect() {
         if (!this.transport) return
         this.players.clear()
+        this.powerupField.clear()
+        this.selfPickups.length = 0
         this.damagePending = 0
         this.latency = null
         this.pendingPing = null

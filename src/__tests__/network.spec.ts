@@ -64,6 +64,37 @@ describe('FlightNetwork wire format', () => {
         expect(network.takeDamage()).toBe(0)
     })
 
+    it('tracks server-owned power-ups and credits only this client\u2019s pickups', () => {
+        const network = new FlightNetwork(() => { })
+        const sent: number[][] = []
+        ;(network as unknown as { writer: { write: (bytes: Uint8Array) => Promise<void> } }).writer = {
+            write: async (bytes: Uint8Array) => { sent.push(decode(bytes) as number[]) },
+        }
+        const handle = (bytes: Uint8Array) => (network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(bytes)
+        // The server assigns this client id 7 before the field is announced, in centimetres.
+        handle(new Uint8Array(encode([0, 7])))
+        handle(new Uint8Array(encode([5, 0, 1200, 4500, -300])))
+        handle(new Uint8Array(encode([5, 1, -2500, 8000, 900])))
+        expect(network.powerups()).toEqual([
+            { slot: 0, x: 12, y: 45, z: -3 },
+            { slot: 1, x: -25, y: 80, z: 9 },
+        ])
+
+        network.reportPickup(0)
+        expect(sent).toEqual([[2, 0]])
+
+        // A peer collecting slot 1 clears it here but pays this client nothing.
+        handle(new Uint8Array(encode([6, 1, 9])))
+        expect(network.takePickups()).toEqual([])
+        expect(network.powerups()).toEqual([{ slot: 0, x: 12, y: 45, z: -3 }])
+
+        // Our own confirmed pickup clears the field everywhere and is drained exactly once.
+        handle(new Uint8Array(encode([6, 0, 7])))
+        expect(network.powerups()).toEqual([])
+        expect(network.takePickups()).toEqual([0])
+        expect(network.takePickups()).toEqual([])
+    })
+
     it('probes the round trip at most once per interval and reports the smoothed latency', () => {
         const network = new FlightNetwork(() => { })
         const sent: number[][] = []

@@ -133,17 +133,40 @@ exactly.
   measures the whole round trip with its own clock. A server that predates the probe simply never
   replies and the HUD shows `-- ms`.
 
+### Client → server: `Pickup`
+
+```text
+[ 2, slot ]
+```
+
+- Sent when the local bird flies within its pickup radius (4 m) of a power-up. The report is a
+  *claim*, not a grant: the client never credits itself ammo. Ammo is owner-local like `health`, so
+  the only thing worth arbitrating is which player won a contested slot.
+- The server accepts the claim only while the slot is still active and the sender's last known
+  position is within 800 cm of it — generous enough to absorb a 20 Hz position update during a fast
+  pass, tight enough that a client cannot collect a power-up it is nowhere near.
+- The first valid claim wins; later reports for the same slot arrive after it is already inactive and
+  are ignored, so two players racing for one pickup cannot both be paid.
+- The tag `2` cannot collide with an update (whose first field is the version `5`), a hit report
+  (`0`) or a ping (`1`): the same two-field fallback decode reads them all and dispatches on tag.
+
 ### Server → client: `Event`
 
 Tagged by a leading integer:
 
 ```text
-welcome: [ 0, id ]
-state:   [ 1, id, sequence, [ ...same 13 position values... ] ]
-leave:   [ 2, id ]
-hit:     [ 3, shooter, victim ]
-pong:    [ 4, nonce ]
+welcome:       [ 0, id ]
+state:         [ 1, id, sequence, [ ...same 13 position values... ] ]
+leave:         [ 2, id ]
+hit:           [ 3, shooter, victim ]
+pong:          [ 4, nonce ]
+powerup_spawn: [ 5, slot, x, y, z ]
+powerup_taken: [ 6, slot, taker ]
 ```
+
+`powerup_spawn` carries world centimetres, matching the position table. `powerup_taken` names the
+slot and the player that collected it, so the taker can credit its own magazine while every other
+client simply clears the pickup from the field.
 
 ## Transport mapping
 
@@ -153,6 +176,9 @@ pong:    [ 4, nonce ]
 | `state` relay (positions) | QUIC datagram | Unreliable, unordered |
 | `Hit` (hit report) | QUIC datagram | Unreliable, unordered |
 | `hit` relay | Unidirectional stream | Reliable, ordered |
+| `Pickup` (pickup claim) | QUIC datagram | Unreliable, unordered |
+| `powerup_spawn` | Unidirectional stream | Reliable, ordered |
+| `powerup_taken` | Unidirectional stream | Reliable, ordered |
 | `Ping` (latency probe) | QUIC datagram | Unreliable, unordered |
 | `pong` (latency echo) | QUIC datagram | Unreliable, unordered |
 | `welcome` | Unidirectional stream | Reliable, ordered |
@@ -173,6 +199,8 @@ Server-side (`Position::valid`, `MAX_PACKET`):
 - Requires every fixed-point field to be within the range in the units table.
 - Rate limits accepted input to at most one update per 25 ms per connection.
 - Echoes a `Ping` (tag `1`) back as a `pong`, rate limited to one echo per 25 ms per connection.
+- Accepts a `Pickup` (tag `2`) only while the named slot is active and the sender's last known
+  position is within 800 cm of it, rate limited to one claim per 25 ms per connection.
 - Rejects non-monotonic `sequence` values per player.
 
 Client-side (`handleEvent`, `decodePosition`, `receiveReliable`):
@@ -181,6 +209,8 @@ Client-side (`handleEvent`, `decodePosition`, `receiveReliable`):
 - Ignores events whose `id` is not a safe integer, and its own `id`.
 - Ignores a position array that is not exactly 13 entries or holds a non-numeric value.
 - Ignores a `pong` whose nonce does not match the probe currently in flight.
+- Ignores `powerup_spawn` / `powerup_taken` events whose fields are not finite numbers, and credits
+  rounds only for a `powerup_taken` that names this client.
 - Ignores reliable stream frames larger than 512 bytes.
 - Drops stale/duplicate `sequence` values.
 
@@ -192,7 +222,9 @@ server expects 13. Version mismatches and short arrays are dropped by validation
 out-of-date tab fall back to `SOLO` and retry. Deploy the server and the frontend together, then
 **hard-refresh every tab that is already open**. The `Ping` / `pong` probe is additive and leaves the
 `Update` shape untouched, so it needs no version bump: an older server that does not understand it
-simply never answers and the HUD leaves the latency blank.
+simply never answers and the HUD leaves the latency blank. The `Pickup` report and the
+`powerup_spawn` / `powerup_taken` events are additive in the same way — new tags, unchanged `Update`
+— so an older server simply never announces a field and the client shows no pickups.
 
 ## Tests
 
@@ -228,6 +260,29 @@ Consequences worth knowing:
   in the room, so this is fine for casual play but **not** suitable for competitive scoring — the
   same caveat the README already applies to client-reported movement.
 - Bullets, muzzle flashes and impacts are never replicated, only the trigger flag and hit reports.
+
+## Power-ups
+
+The power-up field is the one shared resource the server arbitrates. It owns where each pickup sits
+and when it comes back; clients only detect fly-throughs and report them, exactly like hit reports.
+
+- **Field**: `POWERUP_SLOTS` (2) slots. Each is either active — announced to everyone, and to a new
+  joiner in the snapshot that follows `welcome` — or waiting to respawn.
+- **Spawn**: a uniform point in a 300 m disc around the origin, 13–80 m above the terrain. The
+  server reimplements `terrainHeight` from `src/terrain.ts`; `terrain_height_matches_the_client`
+  pins the two formulas together, so a pickup floats at the same height on both sides.
+- **Claim**: the client reports `Pickup` on contact. The server validates it against the sender's
+  last stored position and, on success, marks the slot inactive, arms a 10 s respawn, and broadcasts
+  `powerup_taken` — which is also what tells the taker to credit its magazine.
+- **Respawn**: swept lazily from the update path instead of a timer. A slot whose deadline has passed
+  is moved to a fresh random position and re-announced, which keeps the server free of background
+  tasks (and of any `tokio` `time` feature). The sweep only runs while players are sending updates;
+  with an empty room the field simply waits.
+- **Ammo is not replicated.** Each bird starts with 100 rounds, a pickup adds 100 up to a 300 cap, and
+  a respawn refills to 100. Only the owning client tracks its own magazine, matching `health`.
+- Because a claim is validated against the *last* position the server saw, a legitimate pickup on a
+  fast pass is accepted within 800 cm rather than the client's exact 4 m reach. Erring generous
+  matters more here than tightness: a rejected claim silently costs the player a pickup.
 
 ## Interpolation and expiry
 

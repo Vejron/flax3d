@@ -47,6 +47,12 @@ export const weaponConfig = {
     maxSparks: 320,
     /** Sparks emitted per impact. */
     sparksPerImpact: 14,
+    /** Rounds in a full magazine. The gun refuses to fire once this reaches zero. */
+    magazineSize: 100,
+    /** Rounds granted by one power-up pickup. Ammo stacks, up to `maxRounds`. */
+    pickupRounds: 100,
+    /** Hard cap on carried rounds, so stacked pickups cannot grow without bound. */
+    maxRounds: 300,
 }
 
 export type WeaponConfig = typeof weaponConfig
@@ -372,9 +378,22 @@ export interface WeaponRig {
      * Integrates bullets, refreshes tracers, and ages the impact effects. Only rounds owned by the
      * local shooter test `targets`. The returned array is reused until the next call, so read it now.
      */
-    update: (seconds: number, terrainHeight: (x: number, z: number) => number, targets?: BulletTarget[]) => BulletHit[]
-    /** Releases every GPU resource the rig owns. */
+    update: (seconds: number, terrainHeight: (x: number, z: number) => number, targets?: BulletTarget[]) => BulletHit[]    /** Rounds left in the local shooter's magazine. */
+    readonly rounds: number
+    /** Adds `amount` rounds from a pickup, clamped to `weaponConfig.maxRounds`. */
+    addRounds: (amount: number) => void
+    /** Refills the magazine to `weaponConfig.magazineSize`; used on respawn. */
+    resetRounds: () => void    /** Releases every GPU resource the rig owns. */
     dispose: () => void
+}
+
+/** Optional observers the rig calls as effects happen; used to drive the positional sound engine. */
+export interface WeaponEvents {
+    /**
+     * A round ending on terrain or a bird. `energy` is its impact speed as a fraction of the muzzle
+     * speed, so a target near the muzzle and a long lob can be told apart. Read the values here.
+     */
+    onImpact?: (position: Vec3, energy: number) => void
 }
 
 /** Cooldown key for the player's own gun; remote peers use their network id. */
@@ -385,7 +404,7 @@ const LOCAL_SHOOTER = 0
  * instanced tracer mesh, impact rings are an instanced mesh, and sparks live in
  * one Points buffer. Nothing is allocated per shot, and `dispose` frees it all.
  */
-export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): WeaponRig {
+export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D, events: WeaponEvents = {}): WeaponRig {
     const config = weaponConfig
     const bullets: Bullet[] = []
     const impacts: ImpactVisual[] = []
@@ -395,6 +414,8 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
     /** Bird hits found this frame. Reused every update so the loop allocates nothing. */
     const hits: BulletHit[] = []
     let flash = 0
+    /** Rounds left for the local shooter. Remote shooters never draw from it. */
+    let rounds = config.magazineSize
 
     const bulletGeometry = new THREE.CylinderGeometry(0.02, 0.07, 1, 6, 1, true)
     const bulletMaterial = new THREE.MeshBasicMaterial({
@@ -508,6 +529,9 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
 
     function fire(direction: THREE.Vector3, origin?: THREE.Vector3, shooter = LOCAL_SHOOTER) {
         if ((cooldowns.get(shooter) ?? 0) > 0) return false
+        // Only the local shooter draws from the magazine; a peer's rounds are decorative replays, so
+        // gating here is what guarantees the wire `fire` flag never claims a shot the gun never made.
+        if (shooter === LOCAL_SHOOTER && rounds <= 0) return false
         cooldowns.set(shooter, config.fireInterval)
         const from = origin ?? muzzle.getWorldPosition(position)
         const target = scatter(direction, config.spread)
@@ -515,6 +539,7 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         bullets.push(createBullet({ x: from.x, y: from.y, z: from.z }, target, config, shooter))
         // The flash mesh is parented to the local muzzle, so only light it for the local gun.
         if (shooter === LOCAL_SHOOTER) {
+            rounds -= 1
             flash = 1
             flashMesh.visible = true
         }
@@ -535,9 +560,13 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
             const bullet = bullets[index]!
             // A peer's round is decorative on our screen, so only our own shots can wound a bird.
             const result = stepBullet(bullet, seconds, terrainHeight, config, bullet.owner === LOCAL_SHOOTER ? targets : undefined)
-            if (result.impact) spawnImpact(result.impact)
+            if (result.impact) {
+                spawnImpact(result.impact)
+                events.onImpact?.(result.impact.position, THREE.MathUtils.clamp(result.impact.speed / config.speed, 0.2, 1.4))
+            }
             if (result.hit) {
                 spawnImpact(result.hit)
+                events.onImpact?.(result.hit.position, THREE.MathUtils.clamp(result.hit.speed / config.speed, 0.2, 1.4))
                 hits.push(result.hit)
             }
             if (result.dead) bullets.splice(index, 1)
@@ -636,5 +665,17 @@ export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D): Wea
         hits.length = 0
     }
 
-    return { fire, update, dispose }
+    return {
+        fire,
+        update,
+        dispose,
+        get rounds() { return rounds },
+        addRounds(amount: number) {
+            if (!Number.isFinite(amount) || amount <= 0) return
+            rounds = Math.min(config.maxRounds, rounds + Math.floor(amount))
+        },
+        resetRounds() {
+            rounds = config.magazineSize
+        },
+    }
 }

@@ -6,6 +6,8 @@ import type { RemoteFlight } from '../network'
 /** Minimal 2D context that records the blips `createMinimap` fills. */
 function stubContext() {
     const blips: { x: number; y: number; radius: number; fill: string; alpha: number }[] = []
+    // Path-only fills (the local bird and the power-up diamonds) never call `arc`.
+    const polygons: { fill: string; alpha: number }[] = []
     let current: { x: number; y: number; radius: number } | null = null
     const context = {
         globalAlpha: 1,
@@ -27,9 +29,10 @@ function stubContext() {
         fill() {
             // The scope disc is also filled; only small arcs are contact blips.
             if (current && current.radius <= 5) blips.push({ ...current, fill: context.fillStyle, alpha: context.globalAlpha })
+            else if (!current) polygons.push({ fill: context.fillStyle, alpha: context.globalAlpha })
         },
     }
-    return { context, blips }
+    return { context, blips, polygons }
 }
 
 function contact(id: number, x: number, y: number, z: number, health = 100): RemoteFlight {
@@ -41,10 +44,10 @@ function contact(id: number, x: number, y: number, z: number, health = 100): Rem
 
 function minimapFor() {
     const canvas = document.createElement('canvas')
-    const { context, blips } = stubContext()
+    const { context, blips, polygons } = stubContext()
     // jsdom has no canvas package, so hand the minimap a recording context instead.
     canvas.getContext = (() => context) as unknown as HTMLCanvasElement['getContext']
-    return { minimap: createMinimap(canvas), blips }
+    return { minimap: createMinimap(canvas), blips, polygons }
 }
 
 describe('radar projection', () => {
@@ -116,6 +119,14 @@ describe('createMinimap drawing', () => {
             contact(4, 0, 50, -30, 0),
         ])
         expect(blips.map((blip) => blip.fill)).toEqual(['#8de3b0', '#f0c16a', '#8fd0e8', '#e0886f'])
+    })
+
+    it('adds a gold diamond for every power-up on the field', () => {
+        const { minimap, polygons } = minimapFor()
+        minimap.draw(local, [], [{ slot: 0, x: 0, y: 50, z: -40 }, { slot: 1, x: 90, y: 50, z: 0 }])
+        // Power-ups are drawn before the local bird, which is the last polygon fill.
+        expect(polygons).toHaveLength(3)
+        expect(polygons.map((polygon) => polygon.fill)).toEqual(['#ffd27a', '#ffd27a', '#f7f7ed'])
     })
 
     it('pins out-of-range peers to the rim with a faded blip', () => {

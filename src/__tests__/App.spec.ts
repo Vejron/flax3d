@@ -9,7 +9,10 @@ import { PoseControls } from '../poseControls'
 import { terrainHeight as rollingTerrainHeight } from '../terrain'
 
 vi.mock('../scene', () => ({
-  createScene: () => ({ render: () => { }, dispose: () => { } }),
+  createScene: () => ({
+    render: () => { }, dispose: () => { },
+    rounds: () => 100, addRounds: () => { }, resetRounds: () => { },
+  }),
   terrainHeight: () => 0,
 }))
 vi.stubGlobal('requestAnimationFrame', () => 1)

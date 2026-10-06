@@ -184,6 +184,67 @@ describe('weapon ballistics', () => {
     })
 })
 
+describe('weapon magazine', () => {
+    const flat = () => 0
+    const aim = new THREE.Vector3(0, 0, -1)
+
+    function rig() {
+        const scene = new THREE.Scene()
+        const muzzle = new THREE.Object3D()
+        scene.add(muzzle)
+        muzzle.updateMatrixWorld(true)
+        return createWeaponRig(scene, muzzle)
+    }
+
+    it('starts full and spends exactly one round per shot', () => {
+        const weapon = rig()
+        expect(weapon.rounds).toBe(weaponConfig.magazineSize)
+        expect(weapon.fire(aim)).toBe(true)
+        expect(weapon.rounds).toBe(weaponConfig.magazineSize - 1)
+        // The cooldown still throttles, so a second pull in the same instant spends nothing.
+        expect(weapon.fire(aim)).toBe(false)
+        expect(weapon.rounds).toBe(weaponConfig.magazineSize - 1)
+        weapon.dispose()
+    })
+
+    it('goes dry at zero and fires again the moment it is topped up', () => {
+        const weapon = rig()
+        for (let shot = 0; shot < weaponConfig.magazineSize; shot++) {
+            expect(weapon.fire(aim)).toBe(true)
+            weapon.update(weaponConfig.fireInterval, flat)
+        }
+        expect(weapon.rounds).toBe(0)
+        // A refused shot must not arm the cooldown, or the refilled gun would feel unresponsive.
+        expect(weapon.fire(aim)).toBe(false)
+        weapon.addRounds(weaponConfig.pickupRounds)
+        expect(weapon.fire(aim)).toBe(true)
+        weapon.dispose()
+    })
+
+    it('stacks pickups up to the cap and refills on reset', () => {
+        const weapon = rig()
+        weapon.addRounds(weaponConfig.pickupRounds)
+        expect(weapon.rounds).toBe(200)
+        weapon.addRounds(weaponConfig.pickupRounds)
+        expect(weapon.rounds).toBe(weaponConfig.maxRounds)
+        weapon.addRounds(weaponConfig.pickupRounds)
+        expect(weapon.rounds).toBe(weaponConfig.maxRounds)
+        weapon.addRounds(-50)
+        expect(weapon.rounds).toBe(weaponConfig.maxRounds)
+        weapon.resetRounds()
+        expect(weapon.rounds).toBe(weaponConfig.magazineSize)
+        weapon.dispose()
+    })
+
+    it('never spends the local magazine on a peer\u2019s cosmetic shot', () => {
+        const weapon = rig()
+        expect(weapon.fire(aim, new THREE.Vector3(), 7)).toBe(true)
+        expect(weapon.fire(aim, new THREE.Vector3(), 8)).toBe(true)
+        expect(weapon.rounds).toBe(weaponConfig.magazineSize)
+        weapon.dispose()
+    })
+})
+
 describe('auto-fire cone', () => {
     // Match the shipped Combat-group defaults: 60 m of reach, a 12° half-angle, 0.2 s of dwell.
     const halfAngle = (12 * Math.PI) / 180

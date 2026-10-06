@@ -1,4 +1,5 @@
 import type { RemoteFlight } from './network'
+import type { Powerup } from './powerup'
 
 /** World metres covered by the radar radius before a contact is pinned to the rim. */
 export const RADAR_RANGE = 150
@@ -22,6 +23,8 @@ export const BAND_COLORS: Record<AltitudeBand, string> = {
 }
 
 const WRECK_COLOR = '#e0886f'
+/** Blip colour for a floating power-up, mirrored by the legend swatch in `App.vue`. */
+export const POWERUP_COLOR = '#ffd27a'
 
 /** Classifies a contact by its height relative to the local bird. */
 export function altitudeBand(deltaY: number): AltitudeBand {
@@ -83,7 +86,7 @@ export function createMinimap(canvas: HTMLCanvasElement) {
         canvas.height = Math.round(css * dpr)
     }
 
-    function draw(local: RadarLocal, remotes: RemoteFlight[] = []) {
+    function draw(local: RadarLocal, remotes: RemoteFlight[] = [], powerups: Powerup[] = []) {
         if (!context) return
         fit()
         const center = size / 2
@@ -140,6 +143,25 @@ export function createMinimap(canvas: HTMLCanvasElement) {
                 context.lineTo(px - 3, py + 3)
                 context.stroke()
             }
+        }
+
+        // Power-ups keep their bearing even when beyond the scope, so they read as a destination.
+        for (const powerup of powerups) {
+            const point = radarPoint(local, powerup)
+            const px = center + point.x * radius
+            const py = center + point.y * radius
+            context.globalAlpha = point.clamped ? 0.45 : 0.9
+            context.beginPath()
+            context.moveTo(px, py - 5)
+            context.lineTo(px + 5, py)
+            context.lineTo(px, py + 5)
+            context.lineTo(px - 5, py)
+            context.closePath()
+            context.fillStyle = POWERUP_COLOR
+            context.fill()
+            context.lineWidth = 1
+            context.strokeStyle = 'rgba(12, 34, 27, 0.85)'
+            context.stroke()
         }
 
         // The local bird is the fixed reference at the centre, always pointing up.

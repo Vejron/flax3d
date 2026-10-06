@@ -1,9 +1,11 @@
 import * as THREE from 'three'
+import { createFlapDetector, stepFlapDetector, type FlapDetector } from './audio'
 import { courseRings, courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
 import type { RemoteFlight } from './network'
+import type { Powerup } from './powerup'
 import { terrainHeight } from './terrain'
-import { createGun, createWeaponRig, type BulletTarget, writeAimFromYaw } from './weapon'
+import { createGun, createWeaponRig, type BulletTarget, weaponConfig, writeAimFromYaw } from './weapon'
 
 /** Radius of the sphere bullets test against a bird, in metres. */
 const BIRD_HIT_RADIUS = 1.5
@@ -11,10 +13,72 @@ const BIRD_HIT_RADIUS = 1.5
 const REMOTE_SHAKE_TIME = 0.4
 /** Tumble rate for a bird its owner reported dead, in radians per second. */
 const DEATH_SPIN_RATE = 9
+/** Metres downrange at which the reticle marks the predicted round position. */
+const RETICLE_RANGE = 45
+/** Sprite scale that holds the reticle at a constant size on screen. */
+const RETICLE_SCALE = 0.1
+
+/** Colour the aim reticle is tinted to, driven by the App's body-mode auto-fire state. */
+export type ReticleTint = 'off' | 'seeking' | 'locked' | 'firing'
+
+/** Tint and opacity of the reticle per auto-fire state. */
+const RETICLE_STYLES: Record<ReticleTint, { color: number; opacity: number }> = {
+    off: { color: 0xf2fbf6, opacity: 0.6 },
+    seeking: { color: 0x8fd0e8, opacity: 0.85 },
+    locked: { color: 0xffd98a, opacity: 1 },
+    firing: { color: 0xff9152, opacity: 1 },
+}
+
+/**
+ * Draws the aim reticle as a ring with four ticks. The texture stays white (with a dark halo so it
+ * reads over both the pale sky and the ground) and is tinted per auto-fire state.
+ */
+function createReticleTexture(): THREE.CanvasTexture {
+    const size = 64
+    const canvas = document.createElement('canvas')
+    canvas.width = size
+    canvas.height = size
+    const context = canvas.getContext('2d')
+    if (context) {
+        const center = size / 2
+        context.lineCap = 'round'
+        const stroke = (width: number, color: string) => {
+            context.strokeStyle = color
+            context.lineWidth = width
+            context.beginPath()
+            context.arc(center, center, 20, 0, Math.PI * 2)
+            context.moveTo(center, 3)
+            context.lineTo(center, 12)
+            context.moveTo(center, size - 3)
+            context.lineTo(center, size - 12)
+            context.moveTo(3, center)
+            context.lineTo(12, center)
+            context.moveTo(size - 3, center)
+            context.lineTo(size - 12, center)
+            context.stroke()
+        }
+        stroke(9, '#0e241c')
+        stroke(4, '#ffffff')
+    }
+    return new THREE.CanvasTexture(canvas)
+}
+
+/** A plain 3D point. Event handlers read the numbers immediately, before the scratch vector is reused. */
+export interface PointLike {
+    x: number
+    y: number
+    z: number
+}
 
 export interface SceneHandlers {
     /** Called when a round fired by this client strikes another bird, so the hit can be reported. */
     onHit?: (victimId: number) => void
+    /** Every round that actually leaves a muzzle, local and remote, with its world spawn point. */
+    onShot?: (origin: PointLike) => void
+    /** One wing downstroke, with the bird's world position; `intensity` is `0..1`. */
+    onFlap?: (position: PointLike, intensity: number) => void
+    /** A round stopping on terrain or a bird; `energy` is its speed as a fraction of muzzle speed. */
+    onImpact?: (position: PointLike, energy: number) => void
 }
 
 export { terrainHeight } from './terrain'
@@ -148,7 +212,22 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
     // The gun is added last so the wing shoulder groups keep their child indices.
     const gun = createGun(flyer)
     scene.add(flyer)
-    const weapon = createWeaponRig(scene, gun.muzzle)
+    const weapon = createWeaponRig(scene, gun.muzzle, { onImpact: (position, energy) => handlers.onImpact?.(position, energy) })
+    // Screen-space aim reticle: a billboarded sprite, tinted by the auto-fire state each frame.
+    const reticleTexture = createReticleTexture()
+    const reticleMaterial = new THREE.SpriteMaterial({
+        map: reticleTexture,
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        sizeAttenuation: false,
+        toneMapped: false,
+    })
+    const reticle = new THREE.Sprite(reticleMaterial)
+    reticle.scale.set(RETICLE_SCALE, RETICLE_SCALE, 1)
+    reticle.frustumCulled = false
+    reticle.renderOrder = 3
+    scene.add(reticle)
     const remoteFlyers = new Map<number, THREE.Group>()
     // Remote shots reuse the shared weapon rig, so each avatar only needs its muzzle transform.
     const remoteMuzzles = new Map<number, THREE.Object3D>()
@@ -156,11 +235,50 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
     const remoteHealth = new Map<number, number>()
     /** Decaying hit-shake intensity per peer. */
     const remoteShake = new Map<number, number>()
+    /** Wing-beat detector per peer, so a remote downstroke plays its whoosh at the right moment. */
+    const remoteFlaps = new Map<number, FlapDetector>()
+    /** Wing-beat detector for the local bird. */
+    const localFlap = createFlapDetector()
     /** Reused target objects and the per-frame view handed to the weapon; no per-frame allocation. */
     const hitTargetPool: BulletTarget[] = []
     const hitTargets: BulletTarget[] = []
     const remoteBadgeGeometry = new THREE.SphereGeometry(0.18, 8, 6)
     const remoteBadgeMaterial = new THREE.MeshBasicMaterial({ color: '#45dbbb' })
+
+    // Power-ups: emissive cores inside a spinning ring, so they read as collectible against the sky.
+    const powerupCoreGeometry = new THREE.OctahedronGeometry(0.85, 0)
+    const powerupCoreMaterial = new THREE.MeshStandardMaterial({
+        color: '#ffe9a8', emissive: '#ffab3d', emissiveIntensity: 1.8, roughness: 0.25, metalness: 0.1,
+    })
+    const powerupRingGeometry = new THREE.TorusGeometry(1.4, 0.1, 8, 32)
+    const powerupRingMaterial = new THREE.MeshBasicMaterial({
+        color: '#ffd27a', toneMapped: false, transparent: true, opacity: 0.7,
+        blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+    })
+    /** One visual per live slot, keyed by the server's slot id. */
+    const powerupVisuals = new Map<number, { group: THREE.Group; core: THREE.Mesh; ring: THREE.Mesh }>()
+    // Pooled pickup bursts: a ring that expands and fades where a power-up was just collected.
+    const burstGeometry = new THREE.RingGeometry(0.6, 0.95, 24)
+    burstGeometry.rotateX(-Math.PI / 2)
+    const burstPool = Array.from({ length: 4 }, () => {
+        const material = new THREE.MeshBasicMaterial({
+            color: '#ffe6a0', toneMapped: false, transparent: true, opacity: 0.9,
+            blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+        })
+        const mesh = new THREE.Mesh(burstGeometry, material)
+        mesh.visible = false
+        mesh.frustumCulled = false
+        scene.add(mesh)
+        return { mesh, material, age: 0, life: 0.5 }
+    })
+    let burstCursor = 0
+    function spawnPickupBurst(x: number, y: number, z: number) {
+        const burst = burstPool[burstCursor % burstPool.length]!
+        burstCursor += 1
+        burst.age = 0
+        burst.mesh.position.set(x, y, z)
+        burst.mesh.visible = true
+    }
 
     const courseMarkers = courseRings.map((ring) => {
         const color = ring.kind === 'start' ? '#45dbbb' : ring.kind === 'finish' ? '#ffd07e' : '#e4f5ee'
@@ -202,9 +320,13 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
     const trailView = new THREE.Vector3()
     const trailSide = new THREE.Vector3()
     const aimDirection = new THREE.Vector3()
+    const reticleAim = new THREE.Vector3()
+    const reticlePosition = new THREE.Vector3()
     const remoteAim = new THREE.Vector3()
     const remoteOrigin = new THREE.Vector3()
     const remoteQuaternion = new THREE.Quaternion()
+    /** Reused point handed to the shot handler, so no event allocates per frame. */
+    const shotPoint = { x: 0, y: 0, z: 0 }
 
     const cameraTarget = new THREE.Vector3(
         courseSpawn.x - Math.sin(courseSpawn.yaw) * 12,
@@ -244,7 +366,7 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
             hitTargets.push(target)
         }
     }
-    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = [], fire = false) {
+    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = [], fire = false, reticleTint: ReticleTint = 'off', powerups: Powerup[] = []) {
         const dt = Math.min(elapsed - lastCameraTime, 0.05)
         lastCameraTime = elapsed
         const active = new Set(remotes.map((remote) => remote.id))
@@ -255,6 +377,7 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
                 remoteMuzzles.delete(id)
                 remoteHealth.delete(id)
                 remoteShake.delete(id)
+                remoteFlaps.delete(id)
             }
         }
         for (const remote of remotes) {
@@ -297,15 +420,17 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
                     avatarMuzzle.getWorldPosition(remoteOrigin)
                     avatarMuzzle.getWorldQuaternion(remoteQuaternion)
                     remoteAim.set(0, 0, -1).applyQuaternion(remoteQuaternion)
-                    weapon.fire(remoteAim, remoteOrigin, remote.id)
+                    if (weapon.fire(remoteAim, remoteOrigin, remote.id)) handlers.onShot?.(remoteOrigin)
                 }
             }
             // Remote peers report each shoulder angle, so flapping is visible instead of guessed.
             const fallback = Math.sin(elapsed * 12) * (remote.flap ? 0.55 : 0.07) - (1 - remote.spread) * 0.85
+            let peerWing = 0
             for (let index = 0; index < 2; index++) {
                 const side = index === 0 ? -1 : 1
                 const reported = index === 0 ? remote.flight.wingLeft : remote.flight.wingRight
                 const wingAngle = Number.isFinite(reported) ? reported : fallback
+                peerWing += wingAngle
                 const shoulder = avatar.children[index + 2]!
                 const lag = wingAngle - shoulder.rotation.z * side
                 const tip = THREE.MathUtils.clamp(-0.1 + wingAngle * 0.3 - lag * 0.65, -0.65, 0.65)
@@ -313,6 +438,13 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
                 const elbow = shoulder.children[1]
                 if (elbow) elbow.rotation.z += (side * tip - elbow.rotation.z) * 0.16
             }
+            let peerFlap = remoteFlaps.get(remote.id)
+            if (!peerFlap) {
+                peerFlap = createFlapDetector()
+                remoteFlaps.set(remote.id, peerFlap)
+            }
+            const peerStroke = stepFlapDetector(peerFlap, peerWing / 2)
+            if (peerStroke !== null && !dying) handlers.onFlap?.(avatar.position, peerStroke)
         }
         courseMarkers.forEach((material, index) => { material.emissiveIntensity = index === nextRing ? 1.8 : 0.4 })
         if (input.flap) lastFlapAt = elapsed
@@ -328,6 +460,7 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
             if (side < 0) localWings.left = current
             else localWings.right = current
         }
+        const localStroke = stepFlapDetector(localFlap, (localWings.left + localWings.right) / 2)
         head.rotation.y += ((poseHead?.yaw ?? 0) - head.rotation.y) * 0.18
         head.rotation.z += ((poseHead?.tilt ?? 0) - head.rotation.z) * 0.18
         // A hit rattles the whole bird; a dying one tumbles instead of banking.
@@ -348,9 +481,27 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         camera.position.lerp(cameraTarget, 1 - Math.exp(-3 * dt))
         camera.lookAt(state.x + Math.sin(cameraYaw) * 7, state.y + 1, state.z - Math.cos(cameraYaw) * 7)
         flyer.updateMatrixWorld(true)
+        // The bird is placed before its flap whoosh is sounded, so the position is never a frame stale.
+        if (localStroke !== null && !state.dead) handlers.onFlap?.(flyer.position, localStroke)
         // Fire along the bird's heading, tilted up by the gun mount; gravity provides the drop.
         // `writeAimFromYaw` is shared with the auto-fire cone so the two axes cannot drift apart.
-        if (fire) weapon.fire(writeAimFromYaw(state.yaw, aimDirection))
+        gun.muzzle.getWorldPosition(reticlePosition)
+        if (fire && weapon.fire(writeAimFromYaw(state.yaw, aimDirection))) {
+            shotPoint.x = reticlePosition.x
+            shotPoint.y = reticlePosition.y
+            shotPoint.z = reticlePosition.z
+            handlers.onShot?.(shotPoint)
+        }
+        // Reticle marks the exact spot the next round reaches at RETICLE_RANGE metres, gravity drop
+        // included, so the player can see where a shot is actually going.
+        const drop = 0.5 * weaponConfig.gravity * (RETICLE_RANGE / weaponConfig.speed) ** 2
+        reticlePosition.addScaledVector(writeAimFromYaw(state.yaw, reticleAim), RETICLE_RANGE)
+        reticlePosition.y -= drop
+        reticle.position.copy(reticlePosition)
+        reticle.visible = !state.dead
+        const style = RETICLE_STYLES[reticleTint]
+        reticleMaterial.color.setHex(style.color)
+        reticleMaterial.opacity = style.opacity
         refreshHitTargets()
         for (const hit of weapon.update(dt, terrainHeight, hitTargets)) handlers.onHit?.(hit.targetId)
         for (const trail of trails) {
@@ -387,6 +538,44 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
             colors.needsUpdate = true
             trail.geometry.setDrawRange(0, Math.max(0, count - 1) * 6)
         }
+        // Power-ups bob and spin so they read as pickups; a slot leaving the list means someone
+        // (possibly this client) collected it, which fires a burst at its last position.
+        const activeSlots = new Set<number>()
+        for (const powerup of powerups) {
+            activeSlots.add(powerup.slot)
+            let visual = powerupVisuals.get(powerup.slot)
+            if (!visual) {
+                const core = new THREE.Mesh(powerupCoreGeometry, powerupCoreMaterial)
+                const ring = new THREE.Mesh(powerupRingGeometry, powerupRingMaterial)
+                ring.rotation.x = Math.PI / 2
+                const group = new THREE.Group()
+                group.add(core, ring)
+                group.frustumCulled = false
+                scene.add(group)
+                visual = { group, core, ring }
+                powerupVisuals.set(powerup.slot, visual)
+            }
+            visual.group.position.set(powerup.x, powerup.y + Math.sin(elapsed * 1.7 + powerup.slot) * 0.45, powerup.z)
+            visual.core.rotation.y = elapsed * 1.4 + powerup.slot
+            visual.ring.rotation.z = elapsed * 0.9
+        }
+        for (const [slot, visual] of powerupVisuals) {
+            if (activeSlots.has(slot)) continue
+            spawnPickupBurst(visual.group.position.x, visual.group.position.y, visual.group.position.z)
+            scene.remove(visual.group)
+            powerupVisuals.delete(slot)
+        }
+        for (const burst of burstPool) {
+            if (!burst.mesh.visible) continue
+            burst.age += dt
+            if (burst.age >= burst.life) {
+                burst.mesh.visible = false
+                continue
+            }
+            const progress = burst.age / burst.life
+            burst.mesh.scale.setScalar(1 + progress * 3.4)
+            burst.material.opacity = 0.9 * (1 - progress)
+        }
         renderer.render(scene, camera)
         return localWings
     }
@@ -395,8 +584,18 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         observer.disconnect()
         weapon.dispose()
         gun.dispose()
+        reticleTexture.dispose()
+        reticleMaterial.dispose()
         remoteBadgeGeometry.dispose()
         remoteBadgeMaterial.dispose()
+        powerupCoreGeometry.dispose()
+        powerupRingGeometry.dispose()
+        powerupCoreMaterial.dispose()
+        powerupRingMaterial.dispose()
+        burstGeometry.dispose()
+        burstPool.forEach((burst) => burst.material.dispose())
+        powerupVisuals.forEach((visual) => scene.remove(visual.group))
+        powerupVisuals.clear()
         scene.traverse((object) => {
             if (object instanceof THREE.Mesh) object.geometry.dispose()
         })
@@ -405,5 +604,11 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         renderer.domElement.remove()
     }
 
-    return { render, dispose }
+    return {
+        render,
+        dispose,
+        rounds: () => weapon.rounds,
+        addRounds: (amount: number) => weapon.addRounds(amount),
+        resetRounds: () => weapon.resetRounds(),
+    }
 }

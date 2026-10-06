@@ -2,13 +2,15 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { Camera, CameraOff, Crosshair, Keyboard, MoveUp, RotateCcw, SlidersHorizontal, Target, Wind, X } from 'lucide-vue-next'
 import type { Pose, PoseDetector } from '@tensorflow-models/pose-detection'
+import { createAudio, type FlightAudio } from './audio'
 import { advanceCourse, courseRings, courseSpawn, type CourseProgress } from './course'
 import { applyHit, flightConfig, initialFlightState, respawnFlight, stepFlight, type FlightConfig, type FlightControls } from './flight'
 import { createMinimap } from './minimap'
 import { FlightNetwork, type RemoteFlight } from './network'
 import { PoseControls } from './poseControls'
-import { createScene, terrainHeight } from './scene'
-import { updateAutoFire, type AutoFireTarget } from './weapon'
+import { powerupConfig, withinPickupRange } from './powerup'
+import { createScene, terrainHeight, type ReticleTint } from './scene'
+import { updateAutoFire, type AutoFireTarget, weaponConfig } from './weapon'
 
 const viewport = ref<HTMLElement | null>(null)
 const video = ref<HTMLVideoElement | null>(null)
@@ -30,6 +32,8 @@ const instructionsOpen = ref(false)
 const autoFireEnabled = ref(false)
 const autoFireLocked = ref(false)
 const autoFireFiring = ref(false)
+// Rounds are owner-local like health; the HUD mirrors the weapon rig's magazine each frame.
+const ammoRounds = ref(weaponConfig.magazineSize)
 const tuning = reactive<FlightConfig>({ ...flightConfig })
 type TuningField = { key: keyof FlightConfig; label: string; min: number; max: number; step: number }
 const settingGroups: { title: string; fields: TuningField[] }[] = [
@@ -96,6 +100,8 @@ const headPose = ref<{ yaw: number; tilt: number } | null>(null)
 const seconds = ref(0)
 const mode = computed(() => flight.value.dead ? 'ELIMINATED' : flight.value.flying ? 'IN FLIGHT' : 'ON THE GROUND')
 const healthPercent = computed(() => Math.max(0, Math.min(100, (flight.value.health / tuning.maxHealth) * 100)))
+const ammoLow = computed(() => ammoRounds.value > 0 && ammoRounds.value <= 30)
+const outOfAmmo = computed(() => ammoRounds.value <= 0)
 const latencyClass = computed(() => latencyMs.value === null ? '' : latencyMs.value > 250 ? 'latency-bad' : latencyMs.value > 120 ? 'latency-warn' : '')
 const altitude = computed(() => Math.max(0, flight.value.y - terrainHeight(flight.value.x, flight.value.z)))
 const autoFireStatus = computed(() => {
@@ -103,6 +109,13 @@ const autoFireStatus = computed(() => {
   if (cameraStatus.value !== 'tracking' || !flight.value.flying || flight.value.dead) return 'IDLE'
   if (!autoFireLocked.value) return 'SEEKING'
   return autoFireFiring.value ? 'FIRING' : 'LOCKING'
+})
+// The reticle is pale normally, cyan while armed and scanning, amber on lock, hot orange on fire.
+const reticleTint = computed<ReticleTint>(() => {
+  if (!autoFireEnabled.value || cameraStatus.value !== 'tracking') return 'off'
+  if (autoFireFiring.value) return 'firing'
+  if (autoFireLocked.value) return 'locked'
+  return 'seeking'
 })
 const poseControls = new PoseControls()
 const keys = new Set<string>()
@@ -118,6 +131,7 @@ let poseFrame = 0
 let lastFrame = 0
 let scene: ReturnType<typeof createScene> | null = null
 let minimap: ReturnType<typeof createMinimap> | null = null
+let audio: FlightAudio | null = null
 let running = false
 let network: FlightNetwork | null = null
 let reconnectTimer = 0
@@ -126,6 +140,8 @@ const autoFireTargetPool: AutoFireTarget[] = []
 const autoFireTargets: AutoFireTarget[] = []
 /** Seconds the lock cone has been held; reset whenever auto-fire is not active. */
 let autoFireLock = 0
+/** Power-up slots already reported to the server, so one fly-through is reported only once. */
+const reportedPickups = new Set<number>()
 
 function connectNetwork() {
   if (!running) return
@@ -146,7 +162,14 @@ function connectNetwork() {
   })
 }
 
+/**
+ * Browsers only let an `AudioContext` start from a user gesture, so every input path pokes this.
+ * It is cheap once running and simply builds the (still suspended) graph the first time.
+ */
+function resumeAudio() { void audio?.resume() }
+
 function keyDown(event: KeyboardEvent) {
+  resumeAudio()
   if (event.code === 'Escape') settingsOpen.value = false
   if (event.target instanceof HTMLElement && event.target.closest('button, input, select, textarea')) return
   if (['Space', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.code)) event.preventDefault()
@@ -156,9 +179,9 @@ function keyDown(event: KeyboardEvent) {
 
 function keyUp(event: KeyboardEvent) { keys.delete(event.code) }
 
-function flap() { flapQueued = true }
+function flap() { resumeAudio(); flapQueued = true }
 
-function startFiring() { pointerFiring = true; fireQueued = true }
+function startFiring() { resumeAudio(); pointerFiring = true; fireQueued = true }
 
 function stopFiring() { pointerFiring = false }
 
@@ -244,6 +267,8 @@ function frame(now: number) {
   if (next.dead && next.respawn <= 0) {
     next = respawnFlight(terrainHeight(courseSpawn.x, courseSpawn.z), courseSpawn)
     respawned = true
+    // A rebuilt bird carries a full magazine.
+    scene?.resetRounds()
   }
   flight.value = next
   course.value = respawned ? { nextRing: 0, laps: course.value.laps } : advanceCourse(course.value, previousFlight, next)
@@ -252,6 +277,24 @@ function frame(now: number) {
   nearbyPlayers.value = remotes.length
   const rtt = network?.latencyMs ?? null
   if (rtt !== latencyMs.value) latencyMs.value = rtt
+  // Power-ups: report a fly-through once, then bank the rounds the server confirms. The server
+  // owns the field, so a pickup only lands after it rebroadcasts the taken event to everyone.
+  const powerups = network?.powerups() ?? []
+  for (const powerup of powerups) {
+    if (reportedPickups.has(powerup.slot) || !withinPickupRange(flight.value, powerup, powerupConfig.pickupRadius)) continue
+    reportedPickups.add(powerup.slot)
+    network?.reportPickup(powerup.slot)
+  }
+  // A slot that leaves the field may be collected again once it respawns somewhere else.
+  for (const slot of reportedPickups) {
+    if (!powerups.some((powerup) => powerup.slot === slot)) reportedPickups.delete(slot)
+  }
+  const collected = network?.takePickups() ?? []
+  if (collected.length > 0) {
+    scene?.addRounds(collected.length * weaponConfig.pickupRounds)
+    audio?.pickup(flight.value)
+  }
+  ammoRounds.value = scene?.rounds() ?? ammoRounds.value
   // Body mode leaves no free hand for the trigger: open up while a live rival sits in the cone.
   const autoFireActive = autoFireEnabled.value && tracked && flight.value.flying && !flight.value.dead
   if (autoFireActive) {
@@ -269,10 +312,14 @@ function frame(now: number) {
     autoFireLocked.value = false
     autoFireFiring.value = false
   }
-  const firing = keys.has('KeyF') || fireQueued || pointerFiring || autoFireFiring.value
+  // A dry magazine silences the local trigger, and with it the `fire` flag peers would replay.
+  const firing = ammoRounds.value > 0 && (keys.has('KeyF') || fireQueued || pointerFiring || autoFireFiring.value)
   fireQueued = false
-  minimap?.draw(flight.value, remotes)
-  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes, firing)
+  if (ammoRounds.value <= 0) autoFireFiring.value = false
+  // Wind and the listener both follow the bird, so the mix is always centred on the player.
+  audio?.update(flight.value, flight.value.yaw, Math.hypot(flight.value.speed, flight.value.verticalSpeed))
+  minimap?.draw(flight.value, remotes, powerups)
+  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes, firing, reticleTint.value, powerups)
   network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now, firing)
   renderFrame = requestAnimationFrame(frame)
 }
@@ -304,6 +351,7 @@ async function detectPose() {
 }
 
 async function startCamera() {
+  resumeAudio()
   if (cameraStatus.value === 'loading' || stream) return
   cameraStatus.value = 'loading'
   error.value = ''
@@ -347,12 +395,19 @@ function stopCamera() {
 function calibrate() { if (latestPose) poseControls.calibrate(latestPose) }
 
 onMounted(() => {
-  if (viewport.value) scene = createScene(viewport.value, { onHit: (victimId) => network?.reportHit(victimId) })
+  audio = createAudio()
+  if (viewport.value) scene = createScene(viewport.value, {
+    onHit: (victimId) => network?.reportHit(victimId),
+    onShot: (origin) => audio?.shot(origin),
+    onFlap: (position, intensity) => audio?.flap(position, intensity),
+    onImpact: (position, energy) => audio?.impact(position, energy),
+  })
   if (radar.value) minimap = createMinimap(radar.value)
   running = true
   renderFrame = requestAnimationFrame(frame)
   window.addEventListener('keydown', keyDown)
   window.addEventListener('keyup', keyUp)
+  window.addEventListener('pointerdown', resumeAudio)
   window.addEventListener('pointerup', stopFiring)
   window.addEventListener('pointercancel', stopFiring)
   connectNetwork()
@@ -364,11 +419,14 @@ onBeforeUnmount(() => {
   network?.close()
   cancelAnimationFrame(renderFrame)
   stopCamera()
+  audio?.dispose()
+  audio = null
   minimap?.dispose()
   minimap = null
   scene?.dispose()
   window.removeEventListener('keydown', keyDown)
   window.removeEventListener('keyup', keyUp)
+  window.removeEventListener('pointerdown', resumeAudio)
   window.removeEventListener('pointerup', stopFiring)
   window.removeEventListener('pointercancel', stopFiring)
 })
@@ -395,7 +453,12 @@ onBeforeUnmount(() => {
           <strong>{{ flight.dead ? flight.respawn.toFixed(1) : Math.round(flight.health) }}<small>{{ flight.dead ? 's' :
             '%' }}</small></strong>
         </div>
-        <div class="top-readout"><span>ALTITUDE</span><strong>{{ altitude.toFixed(1) }} <small>m</small></strong></div>
+        <div class="top-readout ammo-readout" :class="{ low: ammoLow, empty: outOfAmmo }">
+          <span>{{ outOfAmmo ? 'EMPTY' : 'AMMO' }}</span>
+          <strong>{{ ammoRounds }}<small v-if="!outOfAmmo"> rds</small></strong>
+        </div>
+        <div class="top-readout altitude-readout"><span>ALTITUDE</span><strong>{{ altitude.toFixed(1) }}
+            <small>m</small></strong></div>
         <button class="settings-toggle" type="button" title="Flight controls" aria-label="Flight controls"
           :aria-expanded="instructionsOpen" @click="instructionsOpen = !instructionsOpen">
           <Keyboard :size="19" />
@@ -406,7 +469,6 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </header>
-    <div class="horizon-label" aria-hidden="true"><span>▲</span> OPEN SKY</div>
     <section v-show="!settingsOpen" class="radar-panel" aria-label="Player radar">
       <div class="radar-head">
         <span>RADAR</span>
@@ -418,13 +480,14 @@ onBeforeUnmount(() => {
         <span><i class="radar-dot level" />LEVEL</span>
         <span><i class="radar-dot above" />ABOVE</span>
         <span><i class="radar-dot below" />BELOW</span>
+        <span><i class="radar-dot powerup" />POWER-UP</span>
       </div>
     </section>
     <section class="dashboard" aria-label="Flight instruments">
       <div class="metric"><span>01 / AIRSPEED</span><strong>{{ Math.round(flight.speed * 3.6) }}<small>
             km/h</small></strong></div>
       <div class="metric"><span>02 / HEADING</span><strong>{{ ((flight.yaw * 180 / Math.PI + 360) % 360).toFixed(0)
-      }}<small>°</small></strong></div>
+          }}<small>°</small></strong></div>
       <div class="metric course-metric"><span>03 / COURSE</span><strong>{{ courseRings[course.nextRing]?.kind ===
         'checkpoint' ?
         `${course.nextRing} / ${courseRings.length - 2}` : courseRings[course.nextRing]?.kind?.toUpperCase() }}<small>
@@ -484,7 +547,7 @@ onBeforeUnmount(() => {
       <section v-if="instructionsOpen" class="instruction-panel" aria-label="Flight controls">
         <div class="instruction-heading">
           <Wind :size="18" /> <span>{{ cameraStatus === 'tracking' ? 'FLY WITH YOUR BODY' : 'FLY WITH YOUR KEYBOARD'
-          }}</span>
+            }}</span>
         </div>
         <div class="instructions" v-if="cameraStatus === 'tracking'">
           <div><span>01</span> Raise & lower both arms <strong>FLAP</strong></div>
@@ -851,25 +914,6 @@ button:disabled {
   font-weight: 500;
 }
 
-.horizon-label {
-  position: absolute;
-  top: 28%;
-  left: 50%;
-  transform: translateX(-50%);
-  color: #315a49;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 2px;
-  white-space: nowrap;
-  opacity: .7;
-}
-
-.horizon-label span {
-  display: block;
-  text-align: center;
-  font-size: 15px;
-}
-
 .radar-panel {
   position: absolute;
   z-index: 4;
@@ -949,6 +993,10 @@ button:disabled {
   background: #8fd0e8;
 }
 
+.radar-dot.powerup {
+  background: #ffd27a;
+}
+
 .dashboard {
   position: absolute;
   left: 34px;
@@ -1001,6 +1049,16 @@ button:disabled {
 /* Narrow layouts have no room for the extra dashboard block, so health moves to the top bar. */
 .health-readout {
   display: none;
+}
+
+/* Rounds are owner-local, so the ammo chip is shown at every width. */
+.ammo-readout.low strong {
+  color: #ffd7a0;
+}
+
+.ammo-readout.empty strong,
+.ammo-readout.empty span {
+  color: #ffb9a5;
 }
 
 .charge-track {
@@ -1378,6 +1436,11 @@ button:focus-visible {
 
   .health-readout.low strong {
     color: #ffb9a5;
+  }
+
+  /* The always-on ammo chip takes the altitude slot, so the top bar still fits three readouts. */
+  .altitude-readout {
+    display: none;
   }
 
   .integrity {
