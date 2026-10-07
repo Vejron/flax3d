@@ -555,9 +555,11 @@ const LOCAL_SHOOTER = 0
  * Renders and simulates the gun. Everything is pooled: bullets are a single
  * instanced tracer mesh, impact rings are an instanced mesh, and sparks live in
  * one Points buffer. Nothing is allocated per shot, and `dispose` frees it all.
+ *
+ * `config` defaults to the bird's gun, so the tank can mount the same rig with its own AA tuning
+ * (see `tankWeaponConfig`) without changing anything about the bird.
  */
-export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D, events: WeaponEvents = {}): WeaponRig {
-    const config = weaponConfig
+export function createWeaponRig(scene: THREE.Scene, muzzle: THREE.Object3D, events: WeaponEvents = {}, config: WeaponConfig = weaponConfig): WeaponRig {
     const bullets: Bullet[] = []
     const impacts: ImpactVisual[] = []
     const sparks: Spark[] = []

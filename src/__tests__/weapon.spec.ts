@@ -3,6 +3,7 @@ import * as THREE from 'three'
 
 import { assistAim, createBullet, createGun, createWeaponRig, gunPitch, interceptTime, scatter, stepBullet, terrainNormal, updateAutoFire, weaponConfig, writeAimFromYaw } from '../weapon'
 import { flightConfig } from '../flight'
+import { tankWeaponConfig, writeTurretAim, type TurretPose } from '../tankWeapon'
 
 describe('weapon ballistics', () => {
     const flat = () => 0
@@ -348,6 +349,98 @@ describe('weapon magazine', () => {
         expect(weapon.fire(aim, new THREE.Vector3(), 8)).toBe(true)
         expect(weapon.rounds).toBe(weaponConfig.magazineSize)
         weapon.dispose()
+    })
+})
+
+describe('tank turret aim', () => {
+    const pose = (over: Partial<TurretPose> = {}): TurretPose => ({ hullYaw: 0, hullPitch: 0, hullRoll: 0, turretYaw: 0, turretPitch: 0, ...over })
+    const target = { x: 0, y: 0, z: 0 }
+
+    it('points level along the hull heading when the turret is centred and un-pitched', () => {
+        const aim = writeTurretAim(pose(), target)
+        expect(Math.hypot(aim.x, aim.y, aim.z)).toBeCloseTo(1, 6)
+        expect(aim.z).toBeCloseTo(-1, 6)
+        expect(aim.y).toBeCloseTo(0, 6)
+    })
+
+    it('adds the turret bearing to the hull heading', () => {
+        expect(writeTurretAim(pose({ turretYaw: Math.PI / 2 }), target).x).toBeCloseTo(1, 6)
+        // A hull turned one way with the turret compensating points the same way.
+        const compensated = writeTurretAim(pose({ hullYaw: Math.PI / 2, turretYaw: -Math.PI / 2 }), target)
+        expect(compensated.z).toBeCloseTo(-1, 6)
+    })
+
+    it('elevates the round with the turret pitch', () => {
+        const elevated = writeTurretAim(pose({ turretPitch: Math.PI / 4 }), target)
+        expect(elevated.y).toBeCloseTo(Math.SQRT1_2, 6)
+        expect(Math.hypot(elevated.x, elevated.y, elevated.z)).toBeCloseTo(1, 6)
+        expect(writeTurretAim(pose({ turretPitch: -Math.PI / 6 }), target).y).toBeLessThan(0)
+    })
+
+    it('carries the hull slope, so the barrel and the ballistics agree on a hill', () => {
+        // Nose up on a slope: the barrel swings up with the hull even with the turret level.
+        const uphill = writeTurretAim(pose({ hullPitch: Math.PI / 6 }), target)
+        expect(uphill.y).toBeCloseTo(Math.sin(Math.PI / 6), 6)
+        // Rolled on its side with the turret abeam, the barrel now points at the sky.
+        const rolled = writeTurretAim(pose({ hullRoll: Math.PI / 2, turretYaw: Math.PI / 2 }), target)
+        expect(rolled.y).toBeCloseTo(1, 6)
+        expect(rolled.x).toBeCloseTo(0, 6)
+    })
+
+    it('matches the rig\u2019s Euler chain exactly', () => {
+        // The rig builds a `YXZ` hull containing a `YXZ` turret. The pure maths must agree with that
+        // chain or the reticle and the rounds would drift away from the barrel the player can see.
+        const cases: TurretPose[] = [
+            { hullYaw: 0.7, hullPitch: 0.25, hullRoll: -0.4, turretYaw: 1.1, turretPitch: 0.6 },
+            { hullYaw: -2.2, hullPitch: -0.15, hullRoll: 0.55, turretYaw: -0.3, turretPitch: -0.1 },
+            { hullYaw: 3.0, hullPitch: 0.6, hullRoll: 0.2, turretYaw: 2.5, turretPitch: 1.2 },
+        ]
+        for (const scenario of cases) {
+            const hull = new THREE.Object3D()
+            hull.rotation.order = 'YXZ'
+            hull.rotation.set(scenario.hullPitch, -scenario.hullYaw, scenario.hullRoll)
+            const turret = new THREE.Object3D()
+            turret.rotation.order = 'YXZ'
+            turret.rotation.set(scenario.turretPitch, -scenario.turretYaw, 0)
+            hull.add(turret)
+            hull.updateMatrixWorld(true)
+            const expected = new THREE.Vector3(0, 0, -1).applyQuaternion(turret.getWorldQuaternion(new THREE.Quaternion()))
+            const aim = writeTurretAim(scenario, { x: 0, y: 0, z: 0 })
+            expect(aim.x).toBeCloseTo(expected.x, 6)
+            expect(aim.y).toBeCloseTo(expected.y, 6)
+            expect(aim.z).toBeCloseTo(expected.z, 6)
+        }
+    })
+})
+
+describe('tank weapon config', () => {
+    it('mounts the shared rig with the AA gun\u2019s own magazine', () => {
+        const scene = new THREE.Scene()
+        const muzzle = new THREE.Object3D()
+        scene.add(muzzle)
+        muzzle.updateMatrixWorld(true)
+        const before = scene.children.length
+
+        const weapon = createWeaponRig(scene, muzzle, {}, tankWeaponConfig)
+        expect(weapon.rounds).toBe(tankWeaponConfig.magazineSize)
+        expect(weapon.rounds).not.toBe(weaponConfig.magazineSize)
+        weapon.addRounds(tankWeaponConfig.maxRounds)
+        expect(weapon.rounds).toBe(tankWeaponConfig.maxRounds)
+
+        weapon.dispose()
+        expect(scene.children.length).toBe(before)
+    })
+
+    it('leaves the bird\u2019s gun untouched by the tank tuning', () => {
+        // The tank config is a spread copy: re-tuning it must not leak into the bird's shipped gun.
+        expect(tankWeaponConfig).not.toBe(weaponConfig)
+        expect(weaponConfig.magazineSize).toBe(100)
+        expect(weaponConfig.speed).toBe(55)
+        expect(tankWeaponConfig.magazineSize).toBe(60)
+        expect(tankWeaponConfig.speed).toBe(90)
+        // Ballistics that should stay shared are inherited rather than dropped.
+        expect(tankWeaponConfig.maxBullets).toBe(weaponConfig.maxBullets)
+        expect(tankWeaponConfig.substep).toBe(weaponConfig.substep)
     })
 })
 

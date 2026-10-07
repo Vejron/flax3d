@@ -10,6 +10,17 @@ export default defineConfig({
     vue(),
     vueDevTools(),
   ],
+  build: {
+    rollupOptions: {
+      // Two entry points: the bird (`/`) and the tank (`/tank/`). Registering both means Vite emits
+      // `dist/tank/index.html` with correctly hashed asset URLs, so `/tank/` is a real page rather
+      // than a client-side branch on the path.
+      input: {
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        tank: fileURLToPath(new URL('./tank/index.html', import.meta.url)),
+      },
+    },
+  },
   server: {
     proxy: {
       '/local-certificate-hash': {

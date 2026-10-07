@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 const MAX_PLAYERS: usize = 32;
 const MAX_PACKET: usize = 512;
 /// Wire schema version, mirrored by `MESSAGE_VERSION` in `src/network.ts`.
-const MESSAGE_VERSION: u8 = 5;
+const MESSAGE_VERSION: u8 = 6;
 /// Tag for a client's hit report (`[0, victimId]`), which cannot be confused with an update.
 const MESSAGE_HIT: u8 = 0;
 /// Tag for a client's latency probe (`[1, nonce]`), which the server echoes back as a `pong`.
@@ -43,25 +43,37 @@ const POWERUP_RESPAWN: StdDuration = StdDuration::from_secs(10);
 const PICKUP_REACH_CM: f64 = 800.0;
 
 /// Fixed-point wire position. Units mirror `src/network.ts` and are documented in NETWORKING.md.
+///
+/// One shape carries both vehicle kinds so the relay stays a single code path: the fields a kind
+/// does not use are simply zero. Field order is positional and must match `encodePosition` exactly.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct Position {
     /// Centimetres.
     x: i32,
     y: i32,
     z: i32,
-    /// Milliradians, wrapped to `[-π, π)` by the sender.
+    /// Milliradians, wrapped to `[-π, π)` by the sender. Hull heading, for a tank.
     yaw: i16,
-    /// Milliradians.
+    /// Vehicle kind: 0 = bird, 1 = tank.
+    kind: u8,
+    /// Milliradians. Bird only.
     bank: i16,
-    /// Centimetres per second.
-    speed: u16,
+    /// Centimetres per second. Signed, so a tank can reverse.
+    speed: i16,
     flying: bool,
-    /// Milli-units in `0..=1000`.
+    /// Milli-units in `0..=1000`. Bird only.
     spread: u16,
     flap: bool,
-    /// Shoulder angles in milliradians.
+    /// Bird shoulder angles in milliradians.
     wing_left: i16,
     wing_right: i16,
+    /// Tank turret bearing relative to the hull, in milliradians.
+    turret_yaw: i16,
+    /// Tank turret elevation in milliradians; negative depresses the barrel.
+    turret_pitch: i16,
+    /// Tank hull slope adopted from the terrain, in milliradians.
+    hull_pitch: i16,
+    hull_roll: i16,
     /// True while the sender is holding the trigger. Relayed so peers can play a cosmetic shot.
     fire: bool,
     /// Hit points in `0..=100`. Owned by the sender's client; the server only relays it.
@@ -74,11 +86,16 @@ impl Position {
             && self.z.abs() <= 45_000
             && (-5_000..=30_000).contains(&self.y)
             && self.yaw.abs() <= 4_000
+            && self.kind <= 1
             && self.bank.abs() <= 1_000
-            && self.speed <= 10_000
+            && (-2_000..=10_000).contains(&self.speed)
             && self.spread <= 1_000
             && self.wing_left.abs() <= 2_000
             && self.wing_right.abs() <= 2_000
+            && self.turret_yaw.abs() <= 4_000
+            && (-1_000..=2_000).contains(&self.turret_pitch)
+            && self.hull_pitch.abs() <= 2_000
+            && self.hull_roll.abs() <= 2_000
             && self.health <= 100
     }
 }
@@ -90,6 +107,7 @@ impl Default for Position {
             y: 0,
             z: 0,
             yaw: 0,
+            kind: 0,
             bank: 0,
             speed: 0,
             flying: false,
@@ -97,6 +115,10 @@ impl Default for Position {
             flap: false,
             wing_left: 0,
             wing_right: 0,
+            turret_yaw: 0,
+            turret_pitch: 0,
+            hull_pitch: 0,
+            hull_roll: 0,
             fire: false,
             health: 100,
         }
@@ -610,12 +632,21 @@ mod tests {
         assert!(!Position { z: -45_001, ..position() }.valid());
         assert!(!Position { y: -5_001, ..position() }.valid());
         assert!(!Position { yaw: 4_001, ..position() }.valid());
+        assert!(!Position { kind: 2, ..position() }.valid());
         assert!(!Position { bank: 1_001, ..position() }.valid());
         assert!(!Position { speed: 10_001, ..position() }.valid());
+        assert!(!Position { speed: -2_001, ..position() }.valid());
         assert!(!Position { spread: 1_001, ..position() }.valid());
         assert!(!Position { wing_left: -2_001, ..position() }.valid());
         assert!(!Position { wing_right: 2_001, ..position() }.valid());
+        assert!(!Position { turret_yaw: -4_001, ..position() }.valid());
+        assert!(!Position { turret_pitch: 2_001, ..position() }.valid());
+        assert!(!Position { turret_pitch: -1_001, ..position() }.valid());
+        assert!(!Position { hull_pitch: 2_001, ..position() }.valid());
+        assert!(!Position { hull_roll: -2_001, ..position() }.valid());
         assert!(!Position { health: 101, ..position() }.valid());
+        // A reversing tank is legal: the speed field is signed.
+        assert!(Position { speed: -500, kind: 1, ..position() }.valid());
     }
 
     /// Byte-for-byte fixture emitted by `encodeUpdate` in `src/network.ts`. If this breaks, the two
@@ -623,8 +654,9 @@ mod tests {
     #[test]
     fn decodes_a_client_update_fixture() {
         let fixture: &[u8] = &[
-            147, 5, 7, 157, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
-            5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 195, 100,
+            147, 6, 7, 220, 0, 18, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 0, 209,
+            254, 32, 205, 5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 0, 0, 0, 0,
+            195, 100,
         ];
         let Update(version, sequence, position) = rmp_serde::from_slice(fixture).unwrap();
         assert_eq!(version, MESSAGE_VERSION);
@@ -636,6 +668,7 @@ mod tests {
                 y: -4_550,
                 z: 900,
                 yaw: 1_571,
+                kind: 0,
                 bank: -480,
                 speed: 1_500,
                 flying: true,
@@ -643,10 +676,34 @@ mod tests {
                 flap: false,
                 wing_left: -250,
                 wing_right: 850,
+                turret_yaw: 0,
+                turret_pitch: 0,
+                hull_pitch: 0,
+                hull_roll: 0,
                 fire: true,
                 health: 100,
             }
         );
+        assert!(position.valid());
+    }
+
+    /// The tank counterpart of the fixture above, emitted by `encodeTankUpdate` in `src/network.ts`.
+    #[test]
+    fn decodes_a_client_tank_fixture() {
+        let fixture: &[u8] = &[
+            147, 6, 9, 220, 0, 18, 205, 8, 2, 205, 1, 69, 209, 240, 21, 209, 251, 80, 1, 0, 209,
+            254, 162, 194, 205, 3, 232, 194, 0, 0, 205, 2, 88, 205, 1, 94, 120, 208, 186, 195,
+            100,
+        ];
+        let Update(version, sequence, position) = rmp_serde::from_slice(fixture).unwrap();
+        assert_eq!(version, MESSAGE_VERSION);
+        assert_eq!(sequence, 9);
+        assert_eq!(position.kind, 1);
+        assert_eq!(position.speed, -350);
+        assert_eq!(position.turret_yaw, 600);
+        assert_eq!(position.turret_pitch, 350);
+        assert_eq!(position.hull_pitch, 120);
+        assert_eq!(position.hull_roll, -70);
         assert!(position.valid());
     }
 

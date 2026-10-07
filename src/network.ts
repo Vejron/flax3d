@@ -1,10 +1,34 @@
 import { decode, encode } from '@msgpack/msgpack'
 import type { FlightControls, FlightState } from './flight'
 import type { Powerup } from './powerup'
+import type { TankState } from './tank'
+import { vehicleFromWire, VEHICLE_WIRE, type VehicleKind } from './vehicle'
+
+/** Motion fields every peer avatar needs, whichever kind of vehicle the sender is driving. */
+export interface RemoteMotion {
+    x: number
+    y: number
+    z: number
+    yaw: number
+    bank: number
+    speed: number
+    flying: boolean
+    health: number
+    wingLeft: number
+    wingRight: number
+    /** Tank only: turret bearing relative to the hull and its elevation. Zero for birds. */
+    turretYaw: number
+    turretPitch: number
+    /** Tank only: hull slope adopted from the terrain. Zero for birds. */
+    hullPitch: number
+    hullRoll: number
+}
 
 export interface RemoteFlight {
     id: number
-    flight: Pick<FlightState, 'x' | 'y' | 'z' | 'yaw' | 'bank' | 'speed' | 'flying' | 'health'> & { wingLeft: number; wingRight: number }
+    /** Which vehicle the peer is driving; decides which avatar is drawn for them. */
+    kind: VehicleKind
+    flight: RemoteMotion
     spread: number
     flap: boolean
     /** True while this peer is holding the trigger; drives a cosmetic shot on each client. */
@@ -39,8 +63,8 @@ const LATENCY_SMOOTHING = 0.3
  * Wire format: MessagePack arrays of fixed-point integers, so both languages encode identically and
  * packets stay small. Units are documented in NETWORKING.md and must match `server/src/main.rs`.
  */
-const MESSAGE_VERSION = 5
-const POSITION_FIELDS = 13
+const MESSAGE_VERSION = 6
+const POSITION_FIELDS = 18
 const CM = 100
 const MRAD = 1000
 /** A tap lasts a single frame, so hold the trigger on for a few updates to survive lost datagrams. */
@@ -73,21 +97,61 @@ const clampInterval = (ms: number) => Math.min(300, Math.max(40, ms))
 
 type WireValue = number | boolean
 
-function encodePosition(flight: FlightState, input: FlightControls, wings: WingAngles, fire: boolean): WireValue[] {
+/** Motion shared by both vehicle kinds, in source units (metres, radians, m/s). */
+interface Motion {
+    x: number
+    y: number
+    z: number
+    yaw: number
+    speed: number
+    health: number
+    fire: boolean
+}
+
+/** Bird-only motion. */
+interface BirdMotion {
+    bank: number
+    flying: boolean
+    spread: number
+    flap: boolean
+    wingLeft: number
+    wingRight: number
+}
+
+/** Tank-only motion. */
+interface TankMotion {
+    turretYaw: number
+    turretPitch: number
+    hullPitch: number
+    hullRoll: number
+}
+
+const NO_TANK: TankMotion = { turretYaw: 0, turretPitch: 0, hullPitch: 0, hullRoll: 0 }
+const NO_BIRD: BirdMotion = { bank: 0, flying: false, spread: 1, flap: false, wingLeft: 0, wingRight: 0 }
+
+/**
+ * Encodes the shared 18-field position array. The order is the contract with `Position` in
+ * `server/src/main.rs` and must match it exactly; NETWORKING.md documents the units.
+ */
+function encodePosition(kind: VehicleKind, motion: Motion, bird: BirdMotion, tank: TankMotion): WireValue[] {
     return [
-        quantize(flight.x, CM), quantize(flight.y, CM), quantize(flight.z, CM),
-        quantize(normalizeYaw(flight.yaw), MRAD), quantize(flight.bank, MRAD),
-        quantize(flight.speed, CM),
-        flight.flying,
-        quantize(input.spread, MRAD),
-        input.flap,
-        quantize(wings.left, MRAD), quantize(wings.right, MRAD),
-        fire,
-        Math.max(0, Math.min(100, Math.round(flight.health))),
+        quantize(motion.x, CM), quantize(motion.y, CM), quantize(motion.z, CM),
+        quantize(normalizeYaw(motion.yaw), MRAD),
+        VEHICLE_WIRE[kind],
+        quantize(bird.bank, MRAD),
+        quantize(motion.speed, CM),
+        bird.flying,
+        quantize(bird.spread, MRAD),
+        bird.flap,
+        quantize(bird.wingLeft, MRAD), quantize(bird.wingRight, MRAD),
+        quantize(tank.turretYaw, MRAD), quantize(tank.turretPitch, MRAD),
+        quantize(tank.hullPitch, MRAD), quantize(tank.hullRoll, MRAD),
+        motion.fire,
+        Math.max(0, Math.min(100, Math.round(motion.health))),
     ]
 }
 
-type DecodedPosition = RemoteFlight['flight'] & { spread: number; flap: boolean; fire: boolean }
+type DecodedPosition = RemoteMotion & { spread: number; flap: boolean; fire: boolean; kind: VehicleKind }
 
 /** One relayed snapshot, stamped with the local time it arrived. */
 interface Snapshot {
@@ -103,25 +167,43 @@ interface RemoteTrack {
     receivedAt: number
 }
 
-/** Encodes one position update. Exported so tests can pin the exact wire bytes. */
+/** Encodes one bird position update. Exported so tests can pin the exact wire bytes. */
 export function encodeUpdate(sequence: number, flight: FlightState, input: FlightControls, wings: WingAngles, fire: boolean): Uint8Array {
-    return encode([MESSAGE_VERSION, sequence, encodePosition(flight, input, wings, fire)])
+    return encode([MESSAGE_VERSION, sequence, encodePosition('bird', {
+        x: flight.x, y: flight.y, z: flight.z, yaw: flight.yaw, speed: flight.speed, health: flight.health, fire,
+    }, {
+        bank: flight.bank, flying: flight.flying, spread: input.spread, flap: input.flap,
+        wingLeft: wings.left, wingRight: wings.right,
+    }, NO_TANK)])
+}
+
+/** Encodes one tank position update; peers tell the two shapes apart by the kind byte. */
+export function encodeTankUpdate(sequence: number, tank: TankState, fire: boolean): Uint8Array {
+    return encode([MESSAGE_VERSION, sequence, encodePosition('tank', {
+        x: tank.x, y: tank.y, z: tank.z, yaw: tank.hullYaw, speed: tank.speed, health: tank.health, fire,
+    }, NO_BIRD, {
+        turretYaw: tank.turretYaw, turretPitch: tank.turretPitch, hullPitch: tank.hullPitch, hullRoll: tank.hullRoll,
+    })])
 }
 
 function decodePosition(raw: unknown): DecodedPosition | null {
     if (!Array.isArray(raw) || raw.length !== POSITION_FIELDS) return null
-    const numbers = [raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[7], raw[9], raw[10], raw[12]]
+    const numbers = [raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[8], raw[12], raw[13], raw[14], raw[15], raw[17]]
     if (!numbers.every((value) => typeof value === 'number' && Number.isFinite(value))) return null
     const scale = (index: number, factor: number) => (raw[index] as number) / factor
     return {
         x: scale(0, CM), y: scale(1, CM), z: scale(2, CM),
-        yaw: scale(3, MRAD), bank: scale(4, MRAD), speed: scale(5, CM),
-        flying: raw[6] === true,
-        spread: scale(7, MRAD),
-        flap: raw[8] === true,
-        wingLeft: scale(9, MRAD), wingRight: scale(10, MRAD),
-        fire: raw[11] === true,
-        health: Math.max(0, Math.min(100, raw[12] as number)),
+        yaw: scale(3, MRAD),
+        kind: vehicleFromWire(raw[4] as number),
+        bank: scale(5, MRAD), speed: scale(6, CM),
+        flying: raw[7] === true,
+        spread: scale(8, MRAD),
+        flap: raw[9] === true,
+        wingLeft: scale(10, MRAD), wingRight: scale(11, MRAD),
+        turretYaw: scale(12, MRAD), turretPitch: scale(13, MRAD),
+        hullPitch: scale(14, MRAD), hullRoll: scale(15, MRAD),
+        fire: raw[16] === true,
+        health: Math.max(0, Math.min(100, raw[17] as number)),
     }
 }
 
@@ -269,7 +351,14 @@ export class FlightNetwork {
             track.receivedAt = now
             track.snapshots.push({
                 at: now,
-                remote: { id: playerId, flight: position, spread: position.spread, flap: position.flap, fire: position.fire },
+                remote: {
+                    id: playerId,
+                    kind: position.kind,
+                    flight: position,
+                    spread: position.spread,
+                    flap: position.flap,
+                    fire: position.fire,
+                },
             })
             if (track.snapshots.length > MAX_SNAPSHOTS) track.snapshots.shift()
         }
@@ -278,21 +367,41 @@ export class FlightNetwork {
     send(flight: FlightState, input: FlightControls, wings: WingAngles, now: number, fire = false) {
         if (!this.writer || now - this.lastSent < SEND_INTERVAL_MS) return
         this.lastSent = now
-        // Datagrams are unreliable and sent at 20 Hz, so a one-frame trigger pull is repeated
-        // across a few updates; otherwise remote clients would miss most single shots.
+        const shot = this.latchFire(fire)
+        void this.writer.write(encodeUpdate(++this.sequence, flight, input, wings, shot)).catch(() => this.disconnect())
+        this.probeLatency(now)
+    }
+
+    /** Sends one tank update over the same connection; the kind byte tells peers which avatar to draw. */
+    sendTank(tank: TankState, now: number, fire = false) {
+        if (!this.writer || now - this.lastSent < SEND_INTERVAL_MS) return
+        this.lastSent = now
+        const shot = this.latchFire(fire)
+        void this.writer.write(encodeTankUpdate(++this.sequence, tank, shot)).catch(() => this.disconnect())
+        this.probeLatency(now)
+    }
+
+    /**
+     * Datagrams are unreliable and sent at 20 Hz, so a one-frame trigger pull is repeated across a
+     * few updates; otherwise remote clients would miss most single shots.
+     */
+    private latchFire(fire: boolean) {
         if (fire) this.fireRepeat = FIRE_REPEAT_UPDATES
         const shot = fire || this.fireRepeat > 0
         if (this.fireRepeat > 0) this.fireRepeat -= 1
-        const message = encodeUpdate(++this.sequence, flight, input, wings, shot)
-        void this.writer.write(message).catch(() => this.disconnect())
-        if (now - this.lastPingAt >= PING_INTERVAL_MS) {
-            // Probe the round trip so the HUD can show a smoothed latency. Like everything else this
-            // rides a datagram, so loss just costs one sample and the next probe covers it.
-            this.lastPingAt = now
-            this.pingNonce = (this.pingNonce + 1) >>> 0
-            this.pendingPing = { nonce: this.pingNonce, sentAt: now }
-            void this.writer.write(encode([MESSAGE_PING, this.pingNonce])).catch(() => this.disconnect())
-        }
+        return shot
+    }
+
+    /**
+     * Probes the round trip so the HUD can show a smoothed latency. Like everything else this rides
+     * a datagram, so loss just costs one sample and the next probe covers it.
+     */
+    private probeLatency(now: number) {
+        if (!this.writer || now - this.lastPingAt < PING_INTERVAL_MS) return
+        this.lastPingAt = now
+        this.pingNonce = (this.pingNonce + 1) >>> 0
+        this.pendingPing = { nonce: this.pingNonce, sentAt: now }
+        void this.writer.write(encode([MESSAGE_PING, this.pingNonce])).catch(() => this.disconnect())
     }
 
     /**
@@ -360,6 +469,8 @@ export class FlightNetwork {
             const previous = older.remote.flight
             const current = newer.remote.flight
             const angle = Math.atan2(Math.sin(current.yaw - previous.yaw), Math.cos(current.yaw - previous.yaw))
+            // The turret bearing is relative to the hull, so it wraps the same way the hull heading does.
+            const turretAngle = Math.atan2(Math.sin(current.turretYaw - previous.turretYaw), Math.cos(current.turretYaw - previous.turretYaw))
             result.push({
                 ...newer.remote, flight: {
                     ...current,
@@ -370,6 +481,10 @@ export class FlightNetwork {
                     bank: previous.bank + (current.bank - previous.bank) * fraction,
                     wingLeft: previous.wingLeft + (current.wingLeft - previous.wingLeft) * fraction,
                     wingRight: previous.wingRight + (current.wingRight - previous.wingRight) * fraction,
+                    turretYaw: previous.turretYaw + turretAngle * fraction,
+                    turretPitch: previous.turretPitch + (current.turretPitch - previous.turretPitch) * fraction,
+                    hullPitch: previous.hullPitch + (current.hullPitch - previous.hullPitch) * fraction,
+                    hullRoll: previous.hullRoll + (current.hullRoll - previous.hullRoll) * fraction,
                 }
             })
         }

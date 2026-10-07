@@ -2,15 +2,22 @@ import { describe, expect, it, vi } from 'vitest'
 import { decode, encode } from '@msgpack/msgpack'
 
 import { initialFlightState } from '../flight'
-import { encodeUpdate, FlightNetwork } from '../network'
+import { encodeTankUpdate, encodeUpdate, FlightNetwork } from '../network'
+import { initialTankState } from '../tank'
 
 /**
  * Pins the exact bytes the server must decode. The matching Rust test is
  * `decodes_a_client_update_fixture` in `server/src/main.rs`; keep the two in sync.
  */
 const FIXTURE = [
-    147, 5, 7, 157, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 209, 254, 32, 205,
-    5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 195, 100,
+    147, 6, 7, 220, 0, 18, 205, 4, 210, 209, 238, 58, 205, 3, 132, 205, 6, 35, 0, 209,
+    254, 32, 205, 5, 220, 195, 205, 3, 232, 194, 209, 255, 6, 205, 3, 82, 0, 0, 0, 0, 195, 100,
+]
+
+/** The same contract for a tank update; the Rust counterpart is `decodes_a_client_tank_fixture`. */
+const TANK_FIXTURE = [
+    147, 6, 9, 220, 0, 18, 205, 8, 2, 205, 1, 69, 209, 240, 21, 209, 251, 80, 1, 0, 209,
+    254, 162, 194, 205, 3, 232, 194, 0, 0, 205, 2, 88, 205, 1, 94, 120, 208, 186, 195, 100,
 ]
 
 describe('FlightNetwork wire format', () => {
@@ -23,15 +30,22 @@ describe('FlightNetwork wire format', () => {
         expect(Array.from(bytes)).toEqual(FIXTURE)
     })
 
-    it('carries the trigger flag as the last position field', () => {
+    it('carries the trigger flag just before the health field', () => {
         const flight = initialFlightState(0)
         const input = { flap: false, steer: 0, spread: 1 }
         const wings = { left: 0, right: 0 }
         const held = (decode(encodeUpdate(1, flight, input, wings, true)) as [number, number, number[]])[2]!
         const idle = (decode(encodeUpdate(1, flight, input, wings, false)) as [number, number, number[]])[2]!
-        expect(held).toHaveLength(13)
-        expect(held[11]).toBe(true)
-        expect(idle[11]).toBe(false)
+        expect(held).toHaveLength(18)
+        expect(held[16]).toBe(true)
+        expect(idle[16]).toBe(false)
+    })
+
+    it('tags a bird update with kind 0 and a tank update with kind 1', () => {
+        const bird = (decode(encodeUpdate(1, initialFlightState(0), { flap: false, steer: 0, spread: 1 }, { left: 0, right: 0 }, false)) as [number, number, number[]])[2]!
+        const tank = (decode(encodeTankUpdate(1, initialTankState(0), false)) as [number, number, number[]])[2]!
+        expect(bird[4]).toBe(0)
+        expect(tank[4]).toBe(1)
     })
 
     it('clamps health into the last position field', () => {
@@ -39,9 +53,18 @@ describe('FlightNetwork wire format', () => {
         const input = { flap: false, steer: 0, spread: 1 }
         const wings = { left: 0, right: 0 }
         const position = (decode(encodeUpdate(1, flight, input, wings, false)) as [number, number, number[]])[2]!
-        expect(position[12]).toBe(40)
+        expect(position[17]).toBe(40)
         const overcharged = (decode(encodeUpdate(1, { ...flight, health: 250 }, input, wings, false)) as [number, number, number[]])[2]!
-        expect(overcharged[12]).toBe(100)
+        expect(overcharged[17]).toBe(100)
+    })
+
+    it('encodes a tank update as a signed fixed-point MessagePack array', () => {
+        const tank = {
+            ...initialTankState(0),
+            x: 20.5, y: 3.25, z: -40.75, hullYaw: -1.2,
+            turretYaw: 0.6, turretPitch: 0.35, hullPitch: 0.12, hullRoll: -0.07, speed: -3.5,
+        }
+        expect(Array.from(encodeTankUpdate(9, tank, true))).toEqual(TANK_FIXTURE)
     })
 
     it('reports hits and only takes damage addressed to this client', () => {
@@ -134,15 +157,32 @@ describe('FlightNetwork wire format', () => {
 
     it('surfaces a peer trigger pull from a relayed state event', () => {
         const network = new FlightNetwork(() => { })
-        // [ x, y, z, yaw, bank, speed, flying, spread, flap, wingLeft, wingRight, fire, health ]
-        const position = [1234, -4550, 900, 0, 0, 1500, true, 1000, false, -250, 850, true, 100]
+        // [ x, y, z, yaw, kind, bank, speed, flying, spread, flap, wingLeft, wingRight,
+        //   turretYaw, turretPitch, hullPitch, hullRoll, fire, health ]
+        const position = [1234, -4550, 900, 0, 0, 0, 1500, true, 1000, false, -250, 850, 0, 0, 0, 0, true, 100]
         const event = new Uint8Array(encode([1, 42, 1, position]))
         ;(network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(event)
         const remotes = network.remotes(performance.now())
         expect(remotes).toHaveLength(1)
         expect(remotes[0]!.id).toBe(42)
+        expect(remotes[0]!.kind).toBe('bird')
         expect(remotes[0]!.fire).toBe(true)
         expect(remotes[0]!.flight.wingLeft).toBeCloseTo(-0.25, 6)
+    })
+
+    it('decodes a relayed tank peer, turret angles included', () => {
+        const network = new FlightNetwork(() => { })
+        const position = [2050, 325, -4075, -1200, 1, 0, -350, false, 1000, false, 0, 0, 600, 350, 120, -70, true, 100]
+        const event = new Uint8Array(encode([1, 7, 1, position]))
+        const handle = (bytes: Uint8Array) => (network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(bytes)
+        handle(event)
+        const [remote] = network.remotes(performance.now())
+        expect(remote!.kind).toBe('tank')
+        expect(remote!.flight.speed).toBeCloseTo(-3.5, 6)
+        expect(remote!.flight.turretYaw).toBeCloseTo(0.6, 6)
+        expect(remote!.flight.turretPitch).toBeCloseTo(0.35, 6)
+        expect(remote!.flight.hullPitch).toBeCloseTo(0.12, 6)
+        expect(remote!.flight.hullRoll).toBeCloseTo(-0.07, 6)
     })
 
     it('interpolates remote motion from the buffered history, not the newest packet', () => {
@@ -150,7 +190,7 @@ describe('FlightNetwork wire format', () => {
         const handle = (bytes: Uint8Array) => (network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(bytes)
         const clock = vi.spyOn(performance, 'now')
         const state = (x: number, sequence: number) =>
-            new Uint8Array(encode([1, 42, sequence, [x, 0, 0, 0, 0, 0, true, 1000, false, 0, 0, false, 100]]))
+            new Uint8Array(encode([1, 42, sequence, [x, 0, 0, 0, 0, 0, 0, true, 1000, false, 0, 0, 0, 0, 0, 0, false, 100]]))
         clock.mockReturnValue(1000); handle(state(100, 1))
         clock.mockReturnValue(1050); handle(state(200, 2))
         clock.mockReturnValue(1100); handle(state(300, 3))
@@ -166,7 +206,7 @@ describe('FlightNetwork wire format', () => {
         const handle = (bytes: Uint8Array) => (network as unknown as { handleEvent: (bytes: Uint8Array) => void }).handleEvent(bytes)
         const clock = vi.spyOn(performance, 'now')
         const state = (x: number, sequence: number) =>
-            new Uint8Array(encode([1, 42, sequence, [x, 0, 0, 0, 0, 0, true, 1000, false, 0, 0, false, 100]]))
+            new Uint8Array(encode([1, 42, sequence, [x, 0, 0, 0, 0, 0, 0, true, 1000, false, 0, 0, 0, 0, 0, 0, false, 100]]))
         clock.mockReturnValue(1000); handle(state(100, 1))
         clock.mockReturnValue(1050); handle(state(200, 2))
         // Sequence 3 is lost, so the next datagram arrives a full 100 ms later. That gap is a drop,

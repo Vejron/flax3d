@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { ALTITUDE_BAND, altitudeBand, createMinimap, RADAR_RANGE, radarPoint } from '../minimap'
+import { ALTITUDE_BAND, altitudeBand, createMinimap, RADAR_RANGE, radarPoint, TANK_COLOR } from '../minimap'
 import type { RemoteFlight } from '../network'
+import type { VehicleKind } from '../vehicle'
 
 /** Minimal 2D context that records the blips `createMinimap` fills. */
 function stubContext() {
@@ -24,7 +25,10 @@ function stubContext() {
         moveTo: () => { },
         lineTo: () => { },
         stroke: () => { },
+        strokeRect: () => { },
         fillText: () => { },
+        // Tanks are drawn as squares rather than arcs, so they record through their own hook.
+        fillRect(x: number, y: number, w: number) { blips.push({ x: x + w / 2, y: y + w / 2, radius: w / 2, fill: context.fillStyle, alpha: context.globalAlpha }) },
         arc(x: number, y: number, radius: number) { current = { x, y, radius } },
         fill() {
             // The scope disc is also filled; only small arcs are contact blips.
@@ -35,10 +39,13 @@ function stubContext() {
     return { context, blips, polygons }
 }
 
-function contact(id: number, x: number, y: number, z: number, health = 100): RemoteFlight {
+function contact(id: number, x: number, y: number, z: number, health = 100, kind: VehicleKind = 'bird'): RemoteFlight {
     return {
-        id, spread: 1, flap: false, fire: false,
-        flight: { x, y, z, yaw: 0, bank: 0, speed: 10, flying: true, wingLeft: 0, wingRight: 0, health },
+        id, kind, spread: 1, flap: false, fire: false,
+        flight: {
+            x, y, z, yaw: 0, bank: 0, speed: 10, flying: kind === 'bird', wingLeft: 0, wingRight: 0, health,
+            turretYaw: 0, turretPitch: 0, hullPitch: 0, hullRoll: 0,
+        },
     }
 }
 
@@ -119,6 +126,15 @@ describe('createMinimap drawing', () => {
             contact(4, 0, 50, -30, 0),
         ])
         expect(blips.map((blip) => blip.fill)).toEqual(['#8de3b0', '#f0c16a', '#8fd0e8', '#e0886f'])
+    })
+
+    it('draws a ground vehicle as a tank-coloured square, not an altitude blip', () => {
+        const { minimap, blips } = minimapFor()
+        minimap.draw(local, [contact(1, 0, 0, -40, 100, 'tank')])
+        expect(blips).toHaveLength(1)
+        expect(blips[0]!.fill).toBe(TANK_COLOR)
+        // Still plotted at its true bearing, ahead of the local vehicle.
+        expect(blips[0]!.y).toBeLessThan(95)
     })
 
     it('adds a gold diamond for every power-up on the field', () => {

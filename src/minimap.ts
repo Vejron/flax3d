@@ -25,6 +25,8 @@ export const BAND_COLORS: Record<AltitudeBand, string> = {
 const WRECK_COLOR = '#e0886f'
 /** Blip colour for a floating power-up, mirrored by the legend swatch in `App.vue`. */
 export const POWERUP_COLOR = '#ffd27a'
+/** Blip colour for a ground vehicle contact, mirrored by the legend swatch in both HUDs. */
+export const TANK_COLOR = '#c58fd8'
 
 /** Classifies a contact by its height relative to the local bird. */
 export function altitudeBand(deltaY: number): AltitudeBand {
@@ -128,13 +130,22 @@ export function createMinimap(canvas: HTMLCanvasElement) {
             const py = center + point.y * radius
             const wreck = health <= 0
             context.globalAlpha = point.clamped ? 0.5 : 1
-            context.beginPath()
-            context.arc(px, py, point.clamped ? 3.5 : 4.5, 0, Math.PI * 2)
-            context.fillStyle = wreck ? WRECK_COLOR : BAND_COLORS[altitudeBand(y - local.y)]
-            context.fill()
-            context.lineWidth = 1
-            context.strokeStyle = 'rgba(12, 34, 27, 0.85)'
-            context.stroke()
+            context.fillStyle = wreck ? WRECK_COLOR : remote.kind === 'tank' ? TANK_COLOR : BAND_COLORS[altitudeBand(y - local.y)]
+            // Tanks are drawn as a square so a ground vehicle never reads as a low-flying bird.
+            if (remote.kind === 'tank') {
+                const half = point.clamped ? 3 : 3.8
+                context.fillRect(px - half, py - half, half * 2, half * 2)
+                context.lineWidth = 1
+                context.strokeStyle = 'rgba(12, 34, 27, 0.85)'
+                context.strokeRect(px - half, py - half, half * 2, half * 2)
+            } else {
+                context.beginPath()
+                context.arc(px, py, point.clamped ? 3.5 : 4.5, 0, Math.PI * 2)
+                context.fill()
+                context.lineWidth = 1
+                context.strokeStyle = 'rgba(12, 34, 27, 0.85)'
+                context.stroke()
+            }
             if (wreck) {
                 context.beginPath()
                 context.moveTo(px - 3, py - 3)
@@ -164,7 +175,7 @@ export function createMinimap(canvas: HTMLCanvasElement) {
             context.stroke()
         }
 
-        // The local bird is the fixed reference at the centre, always pointing up.
+        // The local vehicle is the fixed reference at the centre, always pointing up.
         context.globalAlpha = 1
         context.beginPath()
         context.moveTo(center, center - 7)

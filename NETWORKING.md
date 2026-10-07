@@ -24,7 +24,8 @@ flowchart LR
 ```
 
 The server owns a single shared `Room`. It relays position updates between clients and never runs
-physics or scoring itself — the first release is visual shared flight only.
+physics or scoring itself — the first release is visual shared flight only. Birds and tanks share
+that one room: the relay never inspects `kind`, so a bird and a tank can see and shoot each other.
 
 ## Connection lifecycle
 
@@ -77,18 +78,32 @@ exactly.
 | --- | --- | --- | --- | --- |
 | `x`, `y`, `z` | centimetres | ×100 | `i32` | `±45000` |
 | `yaw` | milliradians, wrapped to `[-π, π)` | ×1000 | `i16` | `±4000` |
+| `kind` | vehicle kind (`0` bird, `1` tank) | — | `u8` | `0..=1` |
 | `bank` | milliradians | ×1000 | `i16` | `±1000` |
-| `speed` | centimetres/second | ×100 | `u16` | `≤10000` |
+| `speed` | centimetres/second, **signed** so a tank can reverse | ×100 | `i16` | `-2000..=10000` |
 | `spread` | milli-units | ×1000 | `u16` | `0..=1000` |
 | `flap`, `flying`, `fire` | boolean | — | bool | — |
 | `wingLeft`, `wingRight` | milliradians | ×1000 | `i16` | `±2000` |
+| `turretYaw` | milliradians, relative to the hull | ×1000 | `i16` | `±4000` |
+| `turretPitch` | milliradians, signed (negative depresses the barrel) | ×1000 | `i16` | `-1000..=2000` |
+| `hullPitch`, `hullRoll` | milliradians, hull slope | ×1000 | `i16` | `±2000` |
 | `health` | hit points | ×1 | `u8` | `0..=100` |
+
+One shape carries both vehicle kinds, so the relay stays a single code path: `kind` says which code
+reads the payload, and the fields a kind does not use are simply zero. A bird zeroes the four tank
+fields; a tank zeroes `bank`, `spread`, `flap`, `flying` and the two wing angles.
 
 ### Client → server: `Update`
 
 ```text
-[ 5, sequence, [ x, y, z, yaw, bank, speed, flying, spread, flap, wingLeft, wingRight, fire, health ] ]
+[ 6, sequence, [ x, y, z, yaw, kind, bank, speed, flying, spread, flap, wingLeft, wingRight, turretYaw, turretPitch, hullPitch, hullRoll, fire, health ] ]
 ```
+
+- The array is positional, so the order above is the contract with `Position` in
+  `server/src/main.rs`. Both fixtures (`FIXTURE` in `src/__tests__/network.spec.ts` and
+  `decodes_a_client_update_fixture` in the Rust tests) pin it; a tank fixture pins the kind-1 case.
+- `kind` selects which vehicle the sender is driving. It is relayed verbatim, so every peer draws the
+  right avatar and reads the right fields without any per-kind message.
 
 - `sequence` is a per-connection counter incremented on every send.
 - `yaw` is wrapped with `atan2(sin, cos)` before scaling. The local yaw grows without bound, so
@@ -193,9 +208,9 @@ reliable streams instead. Well-known ports: QUIC runs on UDP 443 in production.
 
 Server-side (`Position::valid`, `MAX_PACKET`):
 
-- Rejects packets larger than `MAX_PACKET` (512 bytes). A real update encodes to about 35 bytes.
+- Rejects packets larger than `MAX_PACKET` (512 bytes). A real update encodes to about 42 bytes.
 - Rejects datagrams that fail to deserialize as `Update` or as a `Hit` report.
-- Requires `v == 5` (see the migration note below).
+- Requires `v == 6` (see the migration note below).
 - Requires every fixed-point field to be within the range in the units table.
 - Rate limits accepted input to at most one update per 25 ms per connection.
 - Echoes a `Ping` (tag `1`) back as a `pong`, rate limited to one echo per 25 ms per connection.
@@ -217,22 +232,26 @@ Client-side (`handleEvent`, `decodePosition`, `receiveReliable`):
 ## Migration note
 
 Version 3 replaced the earlier JSON encoding outright; there is no dual-dialect path. Version 4
-appended the `fire` flag and version 5 appended `health`, so a v4 client encodes 12 fields while a v5
-server expects 13. Version mismatches and short arrays are dropped by validation, which makes an
-out-of-date tab fall back to `SOLO` and retry. Deploy the server and the frontend together, then
-**hard-refresh every tab that is already open**. The `Ping` / `pong` probe is additive and leaves the
-`Update` shape untouched, so it needs no version bump: an older server that does not understand it
-simply never answers and the HUD leaves the latency blank. The `Pickup` report and the
-`powerup_spawn` / `powerup_taken` events are additive in the same way — new tags, unchanged `Update`
-— so an older server simply never announces a field and the client shows no pickups.
+appended the `fire` flag, version 5 appended `health`, and version 6 added the `kind` byte, the tank's
+`turretYaw` / `turretPitch` / `hullPitch` / `hullRoll` fields, and made `speed` signed. Each bump
+changes the field count, so a v5 client encodes 13 fields while a v6 server expects 18. Version
+mismatches and short arrays are dropped by validation, which makes an out-of-date tab fall back to
+`SOLO` and retry. Deploy the server and the frontend together, then **hard-refresh every tab that is
+already open**. The `Ping` / `pong` probe is additive and leaves the `Update` shape untouched, so it
+needs no version bump: an older server that does not understand it simply never answers and the HUD
+leaves the latency blank. The `Pickup` report and the `powerup_spawn` / `powerup_taken` events are
+additive in the same way — new tags, unchanged `Update` — so an older server simply never announces a
+field and the client shows no pickups.
 
 ## Tests
 
 The wire format is pinned from both sides:
 
-- `decodes_a_client_update_fixture` in `server/src/main.rs` decodes a byte-exact fixture.
+- `decodes_a_client_update_fixture` in `server/src/main.rs` decodes a byte-exact bird fixture, and
+  `decodes_a_client_tank_fixture` does the same for a `kind = 1` tank update.
 - `encodes a position update as a fixed-point MessagePack array` in `src/__tests__/network.spec.ts`
-  asserts the client encoder produces that same fixture.
+  asserts the client encoder produces that same fixture, and
+  `encodes a tank update as a signed fixed-point MessagePack array` pins the tank one.
 
 If either test fails, the two languages have drifted apart. Changing the units table or the field
 order means updating both fixtures together.
@@ -296,8 +315,9 @@ renderer plays that buffer back slightly behind real time:
   margin, so a late or bursty datagram is absorbed by the buffered history instead of freezing the
   avatar or making it race to catch up. The cost is the same delay on every remote avatar.
 - The two snapshots bracketing the render time are interpolated for position, `bank`, `wingLeft`,
-  and `wingRight`; yaw interpolates along the shortest arc. Before the oldest snapshot the cursor
-  clamps to it; past the newest it holds the last pair.
+  `wingRight`, `turretPitch`, `hullPitch` and `hullRoll`; yaw and the turret bearing interpolate
+  along the shortest arc. Before the oldest snapshot the cursor clamps to it; past the newest it
+  holds the last pair.
 - A gap more than `1.5×` the smoothed interval is treated as a **dropped datagram**: the snapshot is
   still buffered, but the gap is not folded into the interval, so a lost packet cannot halve the
   playback rate for the next window. The first measured gap is trusted outright so the rate is right
