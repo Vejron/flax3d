@@ -261,15 +261,15 @@ onBeforeUnmount(() => {
                 <div class="top-readout health-readout" :class="{ low: healthPercent <= 30 }">
                     <span>{{ tank.dead ? 'RESPAWN' : 'INTEGRITY' }}</span>
                     <strong>{{ tank.dead ? tank.respawn.toFixed(1) : Math.round(tank.health) }}<small>{{ tank.dead ? 's'
-                            :
-                            '%' }}</small></strong>
+                        :
+                        '%' }}</small></strong>
                 </div>
                 <div class="top-readout ammo-readout" :class="{ low: ammoLow, empty: outOfAmmo }">
                     <span>{{ outOfAmmo ? 'EMPTY' : 'AMMO' }}</span>
                     <strong>{{ ammoRounds }}<small v-if="!outOfAmmo"> rds</small></strong>
                 </div>
                 <div class="top-readout altitude-readout"><span>SPEED</span><strong>{{ (Math.abs(tank.speed) *
-                        3.6).toFixed(0) }}
+                    3.6).toFixed(0) }}
                         <small>km/h</small></strong></div>
                 <button class="settings-toggle" type="button" title="Tank controls" aria-label="Tank controls"
                     :aria-expanded="instructionsOpen" @click="instructionsOpen = !instructionsOpen">
@@ -298,7 +298,7 @@ onBeforeUnmount(() => {
         </section>
         <section class="dashboard" aria-label="Tank instruments">
             <div class="metric"><span>01 / GROUND SPEED</span><strong>{{ Math.round(Math.abs(tank.speed) * 3.6)
-                    }}<small>
+            }}<small>
                         km/h</small></strong></div>
             <div class="metric"><span>02 / HULL HEADING</span><strong>{{ ((tank.hullYaw * 180 / Math.PI + 360) %
                 360).toFixed(0)
@@ -350,7 +350,7 @@ onBeforeUnmount(() => {
                     <summary>{{ group.title }} <span>{{ group.fields.length }}</span></summary>
                     <div v-for="field in group.fields" :key="field.key" class="setting-row">
                         <label :for="`setting-${field.key}`">{{ field.label }} <output :for="`setting-${field.key}`">{{
-                                displayValue(field) }}</output></label>
+                            displayValue(field) }}</output></label>
                         <input :id="`setting-${field.key}`" v-model.number="tuning[field.key]" type="range"
                             :min="field.min" :max="field.max" :step="field.step" />
                     </div>
