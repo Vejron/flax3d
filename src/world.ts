@@ -370,6 +370,10 @@ export function createWorld(container: HTMLElement, options: WorldOptions): Worl
                 remoteMuzzles.delete(remote.id)
                 const avatarMuzzle = avatar.getObjectByName('muzzle')
                 if (avatarMuzzle) remoteMuzzles.set(remote.id, avatarMuzzle)
+                // The local rig doubles as the bird prototype, so a fresh clone inherits whatever head
+                // pose it was built with; clear it, since head aim is not networked.
+                const avatarHead = avatar.getObjectByName('head')
+                if (avatarHead) avatarHead.rotation.set(0, 0, 0)
             }
             // Arm a shake when a peer's reported health drops, and tumble a bird while it is dead.
             const lastHealth = remoteHealth.get(remote.id)

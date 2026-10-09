@@ -41,6 +41,16 @@ export const weaponConfig = {
     aimAssistRange: 70,
     /** Fraction of the aiming error the assist removes, `0..1`. Kept partial so it stays soft. */
     aimAssistStrength: 0.6,
+    /**
+     * Fraction of the tracked head turn applied to the aim, `0..1`. The head yaw is measured against
+     * the shoulders (which steer the bird), so this lets a glance fine-tune the shot without
+     * wrestling the flight path. Zero disables head aiming entirely.
+     */
+    headAimGain: 0.7,
+    /** Largest head-driven yaw offset from the flight heading, in radians (~26 degrees). */
+    headAimYawLimit: 0.45,
+    /** Largest head-driven pitch offset added to the gun mount, in radians (~14 degrees). */
+    headAimPitchLimit: 0.25,
     /** Seconds between shots while the trigger is held. */
     fireInterval: 0.11,
     /** Hard cap on live bullets; the pool never grows past this. */
@@ -368,27 +378,45 @@ export function stepBullet(
     }
 }
 
-export interface Gun {
-    muzzle: THREE.Object3D
-    dispose: () => void
-}
-
 /**
- * Upward tilt of the gun mount, in radians. Applied both to the barrel mesh and
-to the local shot direction so the visual and the ballistics agree.
+ * Upward tilt of the gun mount, in radians. Applied to the beak muzzle marker and to the local shot
+ * direction, so a peer's cosmetic tracer leaves at the same lift the round does.
  */
 export const gunPitch = THREE.MathUtils.degToRad(10)
 
+/** Head-driven aim offsets, in radians, added on top of the flight heading and the gun mount. */
+export interface HeadAim {
+    yaw: number
+    pitch: number
+}
+
 /**
- * Writes the local shot direction into `out`: the bird's heading pitched up by the gun mount.
- * Both the gun and the body-mode auto-fire cone use this, so the volume the player aims into can
- * never disagree with where the round actually goes.
+ * Scales a tracked head pose into the offsets the shot uses. The pose is measured against the
+ * player's shoulders, so a head turn reads as "aim left or right of the flight path". Offsets are
+ * clamped so a glance can never swing the shot far off the heading, and a missing pose (tracking
+ * lost) leaves the round on the flight heading.
  */
-export function writeAimFromYaw<T extends Vec3>(yaw: number, out: T): T {
-    const cosPitch = Math.cos(gunPitch)
-    out.x = Math.sin(yaw) * cosPitch
-    out.y = Math.sin(gunPitch)
-    out.z = -Math.cos(yaw) * cosPitch
+export function headAimOffset(head: { yaw: number; pitch?: number } | null | undefined, config: WeaponConfig = weaponConfig): HeadAim {
+    const gain = config.headAimGain
+    const clampOffset = (value: number, limit: number) => Math.max(-limit, Math.min(limit, value))
+    return {
+        yaw: clampOffset((head?.yaw ?? 0) * gain, config.headAimYawLimit),
+        pitch: clampOffset((head?.pitch ?? 0) * gain, config.headAimPitchLimit),
+    }
+}
+
+/**
+ * Writes the local shot direction into `out`: the bird's heading pitched up by the gun mount, plus
+ * any head-driven offset. The beak muzzle marker, the local shot and the body-mode auto-fire cone
+ * all use this, so the volume the player aims into can never disagree with where the round goes.
+ */
+export function writeAimFromYaw<T extends Vec3>(yaw: number, out: T, yawOffset = 0, pitchOffset = 0): T {
+    const heading = yaw + yawOffset
+    const pitch = gunPitch + pitchOffset
+    const cosPitch = Math.cos(pitch)
+    out.x = Math.sin(heading) * cosPitch
+    out.y = Math.sin(pitch)
+    out.z = -Math.cos(heading) * cosPitch
     return out
 }
 
@@ -400,6 +428,10 @@ export interface AutoFireOptions {
     halfAngle: number
     /** Seconds of continuous alignment required before the first shot. */
     dwell: number
+    /** Head-driven yaw offset added to the cone axis, so the gate follows the gaze aim. */
+    yawOffset?: number
+    /** Head-driven pitch offset added to the gun mount. */
+    pitchOffset?: number
 }
 
 /** A bird the cone can lock; positions are raw flight coordinates (no avatar offset). */
@@ -435,7 +467,7 @@ export function updateAutoFire(
     targets: readonly AutoFireTarget[],
     options: AutoFireOptions,
 ): AutoFireResult {
-    const aim = writeAimFromYaw(yaw, autoFireAim)
+    const aim = writeAimFromYaw(yaw, autoFireAim, options.yawOffset ?? 0, options.pitchOffset ?? 0)
     const cosLimit = Math.cos(options.halfAngle)
     const rangeSquared = options.range * options.range
     let locked = false
@@ -457,51 +489,6 @@ export function updateAutoFire(
     }
     const next = locked ? lock + Math.max(0, seconds) : 0
     return { lock: next, locked, fire: locked && next >= options.dwell }
-}
-
-/**
- * Adds a forward-facing cannon on the flyer's back and returns its muzzle
- * marker, which the weapon rig uses as the spawn point for rounds. It sits
- * above the body silhouette so the chase camera never occludes it.
- */
-export function createGun(flyer: THREE.Object3D): Gun {
-    const metal = new THREE.MeshStandardMaterial({ color: '#39434a', roughness: 0.45, metalness: 0.55 })
-    const trim = new THREE.MeshStandardMaterial({ color: '#c96b3f', roughness: 0.6, metalness: 0.25 })
-    const group = new THREE.Group()
-    group.name = 'gun'
-
-    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.095, 1.6, 10), metal)
-    barrel.rotation.x = Math.PI / 2
-    barrel.position.set(0, 0, -0.5)
-    const housing = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.26, 0.44), trim)
-    housing.position.set(0, -0.05, 0.24)
-    const pylon = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.75, 0.2), metal)
-    pylon.position.set(0, -0.42, 0.3)
-    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.1, 0.26), metal)
-    sight.position.set(0, 0.18, -0.15)
-
-    const muzzle = new THREE.Object3D()
-    muzzle.name = 'muzzle'
-    muzzle.position.set(0, 0, -1.36)
-
-    group.add(barrel, housing, pylon, sight, muzzle)
-    group.position.set(0, 1, -0.3)
-    // Nose the whole mount up so the barrel (and the muzzle marker) aim slightly skyward.
-    group.rotation.x = gunPitch
-    flyer.add(group)
-
-    return {
-        muzzle,
-        dispose() {
-            flyer.remove(group)
-            barrel.geometry.dispose()
-            housing.geometry.dispose()
-            pylon.geometry.dispose()
-            sight.geometry.dispose()
-            metal.dispose()
-            trim.dispose()
-        },
-    }
 }
 
 interface ImpactVisual {

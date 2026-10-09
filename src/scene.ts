@@ -3,10 +3,11 @@ import { createFlapDetector, stepFlapDetector } from './audio'
 import { courseSpawn } from './course'
 import type { FlightControls, FlightState } from './flight'
 import type { RemoteFlight } from './network'
+import type { HeadPose } from './poseControls'
 import type { Powerup } from './powerup'
 import { terrainHeight } from './terrain'
 import { buildFlyer } from './vehicles'
-import { assistAim, weaponConfig, writeAimFromYaw } from './weapon'
+import { assistAim, headAimOffset, weaponConfig, writeAimFromYaw } from './weapon'
 import { createWorld, RETICLE_RANGE, type ReticleTint, type SceneHandlers } from './world'
 
 export type { ReticleTint, SceneHandlers } from './world'
@@ -16,15 +17,15 @@ export { terrainHeight } from './terrain'
 const TRAIL_SAMPLES = 64
 
 /**
- * The bird's rig: everything specific to flying — the wing beat, the wingtip trails, the back gun
- * and a chase camera behind the bird. The shared stage (terrain, peers, power-ups, the weapon rig)
- * lives in `world.ts`.
+ * The bird's rig: everything specific to flying — the wing beat, the wingtip trails, the beak
+ * muzzle and a chase camera behind the bird. The shared stage (terrain, peers, power-ups, the
+ * weapon rig) lives in `world.ts`.
  */
 export function createScene(container: HTMLElement, handlers: SceneHandlers = {}) {
     const flyer = buildFlyer()
     const world = createWorld(container, {
         vehicle: flyer.group,
-        muzzle: flyer.gun.muzzle,
+        muzzle: flyer.muzzle,
         kind: 'bird',
         config: weaponConfig,
         handlers,
@@ -68,7 +69,7 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
     /** Wing-beat detector for the local bird. */
     const localFlap = createFlapDetector()
 
-    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: { yaw: number; tilt: number } | null, nextRing: number, remotes: RemoteFlight[] = [], fire = false, reticleTint: ReticleTint = 'off', powerups: Powerup[] = []) {
+    function render(state: FlightState, elapsed: number, input: FlightControls, poseWings: { leftWing: number; rightWing: number } | null, poseHead: HeadPose | null, nextRing: number, remotes: RemoteFlight[] = [], fire = false, reticleTint: ReticleTint = 'off', powerups: Powerup[] = []) {
         const dt = Math.min(elapsed - lastCameraTime, 0.05)
         lastCameraTime = elapsed
         // Peers first: their avatars are placed and their cosmetic shots replayed, which also rebuilds
@@ -91,7 +92,11 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
             else localWings.right = current
         }
         const localStroke = stepFlapDetector(localFlap, (localWings.left + localWings.right) / 2)
-        flyer.head.rotation.y += ((poseHead?.yaw ?? 0) - flyer.head.rotation.y) * 0.18
+        // Head aim: the same clamped offset the shot uses turns the head, so the beak leads the
+        // round. Yaw is negated because the model's local forward is -Z (see `vehicles.ts`).
+        const headAim = headAimOffset(poseHead)
+        flyer.head.rotation.x += (headAim.pitch - flyer.head.rotation.x) * 0.18
+        flyer.head.rotation.y += (-headAim.yaw - flyer.head.rotation.y) * 0.18
         flyer.head.rotation.z += ((poseHead?.tilt ?? 0) - flyer.head.rotation.z) * 0.18
         // A hit rattles the whole bird; a dying one tumbles instead of banking.
         const tumble = state.dead ? state.spin : 0
@@ -113,13 +118,13 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         flyer.group.updateMatrixWorld(true)
         // The bird is placed before its flap whoosh is sounded, so the position is never a frame stale.
         if (localStroke !== null && !state.dead) handlers.onFlap?.(flyer.group.position, localStroke)
-        // Fire along the bird's heading, tilted up by the gun mount; gravity provides the drop.
-        // `writeAimFromYaw` is shared with the auto-fire cone so the two axes cannot drift apart,
-        // and `assistAim` then bends the round slightly toward a rival already near the line, which
-        // is what makes gunnery workable while the pilot is flapping.
-        flyer.gun.muzzle.getWorldPosition(reticlePosition)
+        // Fire along the bird's heading, lifted by the gun mount and slewed by the pilot's head;
+        // gravity provides the drop. `writeAimFromYaw` is shared with the auto-fire cone so the two
+        // axes cannot drift apart, and `assistAim` then bends the round slightly toward a rival
+        // already near the line, which is what makes gunnery workable while the pilot is flapping.
+        flyer.muzzle.getWorldPosition(reticlePosition)
         if (fire) {
-            writeAimFromYaw(state.yaw, aimDirection)
+            writeAimFromYaw(state.yaw, aimDirection, headAim.yaw, headAim.pitch)
             if (world.weapon.fire(assistAim(reticlePosition, aimDirection, world.hitTargets))) {
                 handlers.onShot?.(reticlePosition)
             }
@@ -127,7 +132,7 @@ export function createScene(container: HTMLElement, handlers: SceneHandlers = {}
         // Reticle marks the exact spot the next round reaches at RETICLE_RANGE metres, gravity drop
         // included, so the player can see where a shot is actually going.
         const drop = 0.5 * weaponConfig.gravity * (RETICLE_RANGE / weaponConfig.speed) ** 2
-        reticlePosition.addScaledVector(writeAimFromYaw(state.yaw, reticleAim), RETICLE_RANGE)
+        reticlePosition.addScaledVector(writeAimFromYaw(state.yaw, reticleAim, headAim.yaw, headAim.pitch), RETICLE_RANGE)
         reticlePosition.y -= drop
         world.reticle.position.copy(reticlePosition)
         world.reticle.visible = !state.dead

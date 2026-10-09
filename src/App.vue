@@ -7,10 +7,10 @@ import { advanceCourse, courseRings, courseSpawn, type CourseProgress } from './
 import { applyHit, flightConfig, initialFlightState, respawnFlight, stepFlight, type FlightConfig, type FlightControls } from './flight'
 import { createMinimap } from './minimap'
 import { FlightNetwork, type RemoteFlight } from './network'
-import { PoseControls } from './poseControls'
+import { PoseControls, type HeadPose } from './poseControls'
 import { powerupConfig, withinPickupRange } from './powerup'
 import { createScene, terrainHeight, type ReticleTint } from './scene'
-import { updateAutoFire, type AutoFireTarget, weaponConfig } from './weapon'
+import { headAimOffset, updateAutoFire, type AutoFireTarget, weaponConfig } from './weapon'
 
 const viewport = ref<HTMLElement | null>(null)
 const video = ref<HTMLVideoElement | null>(null)
@@ -96,7 +96,7 @@ const settingGroups: { title: string; fields: TuningField[] }[] = [
   },
 ]
 const wingPose = ref<{ leftWing: number; rightWing: number } | null>(null)
-const headPose = ref<{ yaw: number; tilt: number } | null>(null)
+const headPose = ref<HeadPose | null>(null)
 const seconds = ref(0)
 const mode = computed(() => flight.value.dead ? 'ELIMINATED' : flight.value.flying ? 'IN FLIGHT' : 'ON THE GROUND')
 const healthPercent = computed(() => Math.max(0, Math.min(100, (flight.value.health / tuning.maxHealth) * 100)))
@@ -296,6 +296,9 @@ function frame(now: number) {
   }
   ammoRounds.value = scene?.rounds() ?? ammoRounds.value
   // Body mode leaves no free hand for the trigger: open up while a live rival sits in the cone.
+  // The cone follows the same head-aim offset the shot does, so the gate and the round agree.
+  const liveHead = tracked && now - lastPoseAt < 200 ? headPose.value : null
+  const aimHead = headAimOffset(liveHead)
   const autoFireActive = autoFireEnabled.value && tracked && flight.value.flying && !flight.value.dead
   if (autoFireActive) {
     refreshAutoFireTargets(remotes)
@@ -303,6 +306,8 @@ function frame(now: number) {
       range: tuning.autoFireRange,
       halfAngle: (tuning.autoFireAngle * Math.PI) / 180,
       dwell: tuning.autoFireDwell,
+      yawOffset: aimHead.yaw,
+      pitchOffset: aimHead.pitch,
     })
     autoFireLock = gate.lock
     autoFireLocked.value = gate.locked
@@ -319,7 +324,7 @@ function frame(now: number) {
   // Wind and the listener both follow the bird, so the mix is always centred on the player.
   audio?.update(flight.value, flight.value.yaw, Math.hypot(flight.value.speed, flight.value.verticalSpeed))
   minimap?.draw(flight.value, remotes, powerups)
-  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, tracked && now - lastPoseAt < 200 ? headPose.value : null, course.value.nextRing, remotes, firing, reticleTint.value, powerups)
+  const wings = scene?.render(flight.value, seconds.value, input, tracked ? wingPose.value : null, liveHead, course.value.nextRing, remotes, firing, reticleTint.value, powerups)
   network?.send(flight.value, input, wings ?? { left: 0, right: 0 }, now, firing)
   renderFrame = requestAnimationFrame(frame)
 }

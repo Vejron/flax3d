@@ -171,6 +171,34 @@ describe('flight', () => {
     expect(state.flying).toBe(true)
   })
 
+  it('reads a head turn and a head lift from the face landmarks', () => {
+    const adapter = new PoseControls()
+    const facePose = (noseX: number, noseY: number): Pose => ({
+      keypoints: [
+        { name: 'left_shoulder', x: 100, y: 100, score: 0.95 },
+        { name: 'right_shoulder', x: 200, y: 100, score: 0.95 },
+        { name: 'left_wrist', x: 50, y: 100, score: 0.95 },
+        { name: 'right_wrist', x: 250, y: 100, score: 0.95 },
+        { name: 'left_ear', x: 160, y: 60, score: 0.95 },
+        { name: 'right_ear', x: 240, y: 60, score: 0.95 },
+        { name: 'left_eye', x: 180, y: 66, score: 0.95 },
+        { name: 'right_eye', x: 220, y: 66, score: 0.95 },
+        { name: 'nose', x: noseX, y: noseY, score: 0.95 },
+      ],
+    })
+    // The first frame both centres the head and yields no offset, so a fresh pilot aims straight.
+    const centred = adapter.update(facePose(200, 80), 0)!
+    expect(centred.head).not.toBeNull()
+    expect(centred.head!.yaw).toBeCloseTo(0, 6)
+    expect(centred.head!.pitch).toBeCloseTo(0, 6)
+    // A nose shifted toward the left ear reads as a head turn; a nose closer to the eye line as a
+    // lift. Both settle through the smoothing over a few dozen frames.
+    let turned = centred
+    for (let frame = 0; frame < 40; frame++) turned = adapter.update(facePose(170, 74), (frame + 1) * 100)!
+    expect(turned.head!.yaw).toBeGreaterThan(0.3)
+    expect(turned.head!.pitch).toBeGreaterThan(0)
+  })
+
   it('uses the same flap physics once airborne regardless of altitude', () => {
     const controls = { flap: false, flapPower: 0.3, steer: 0, spread: 1 }
     const start = { ...initialFlightState(0), flying: true, speed: 8 }

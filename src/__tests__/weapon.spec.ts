@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import * as THREE from 'three'
 
-import { assistAim, createBullet, createGun, createWeaponRig, gunPitch, interceptTime, scatter, stepBullet, terrainNormal, updateAutoFire, weaponConfig, writeAimFromYaw } from '../weapon'
+import { assistAim, createBullet, createWeaponRig, gunPitch, headAimOffset, interceptTime, scatter, stepBullet, terrainNormal, updateAutoFire, weaponConfig, writeAimFromYaw } from '../weapon'
 import { flightConfig } from '../flight'
 import { tankWeaponConfig, writeTurretAim, type TurretPose } from '../tankWeapon'
+import { buildFlyer } from '../vehicles'
 
 describe('weapon ballistics', () => {
     const flat = () => 0
@@ -130,23 +131,43 @@ describe('weapon ballistics', () => {
     })
 
     it('exposes a named muzzle on a cloned avatar so peers can spawn shots from it', () => {
-        const flyer = new THREE.Group()
-        flyer.position.set(3, 5, -2)
-        flyer.rotation.set(0, -0.7, 0.1)
-        const gun = createGun(flyer)
-        const avatar = flyer.clone(true)
-        flyer.updateMatrixWorld(true)
+        const rig = buildFlyer()
+        rig.group.position.set(3, 5, -2)
+        rig.group.rotation.set(0, -0.7, 0.1)
+        rig.group.updateMatrixWorld(true)
+        const avatar = rig.group.clone(true)
+        avatar.updateMatrixWorld(true)
 
         const cloneMuzzle = avatar.getObjectByName('muzzle')
         expect(cloneMuzzle).toBeDefined()
-        expect(cloneMuzzle).not.toBe(gun.muzzle)
+        expect(cloneMuzzle).not.toBe(rig.muzzle)
+        if (!cloneMuzzle) throw new Error('the clone lost its muzzle marker')
 
         const world = new THREE.Vector3()
-        gun.muzzle.getWorldPosition(world)
+        cloneMuzzle.getWorldPosition(world)
         expect(Number.isFinite(world.x)).toBe(true)
         expect(world.y).toBeGreaterThan(5)
 
-        gun.dispose()
+        rig.dispose()
+    })
+
+    it('points the beak muzzle along the head-adjusted aim', () => {
+        const rig = buildFlyer()
+        const yaw = 0.9
+        const yawOffset = 0.3
+        const pitchOffset = -0.12
+        rig.group.rotation.set(0, -yaw, 0)
+        rig.head.rotation.set(pitchOffset, -yawOffset, 0)
+        rig.group.updateMatrixWorld(true)
+
+        const quaternion = new THREE.Quaternion()
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(rig.muzzle.getWorldQuaternion(quaternion))
+        const aim = writeAimFromYaw(yaw, { x: 0, y: 0, z: 0 }, yawOffset, pitchOffset)
+        expect(forward.x).toBeCloseTo(aim.x, 6)
+        expect(forward.y).toBeCloseTo(aim.y, 6)
+        expect(forward.z).toBeCloseTo(aim.z, 6)
+
+        rig.dispose()
     })
 
     it('detects a bird in flight before the ground behind it', () => {
@@ -511,5 +532,33 @@ describe('auto-fire cone', () => {
         expect(state.locked).toBe(false)
         expect(state.fire).toBe(false)
         expect(state.lock).toBe(0)
+    })
+
+    it('follows the head-aim offset so the gate and the round agree', () => {
+        // A rival parked on the head-aimed axis, deliberately wider than the cone half-angle.
+        const yawOffset = 0.8
+        const aim = writeAimFromYaw(0, { x: 0, y: 0, z: 0 }, yawOffset, 0)
+        const onAxis = { x: aim.x * 40, y: aim.y * 40, z: aim.z * 40 }
+        expect(updateAutoFire(0, 0.05, origin, 0, [onAxis], options).locked).toBe(false)
+        expect(updateAutoFire(0, 0.05, origin, 0, [onAxis], { ...options, yawOffset }).locked).toBe(true)
+    })
+})
+
+describe('head aim', () => {
+    it('scales a tracked head pose into clamped aim offsets', () => {
+        const aim = headAimOffset({ yaw: 0.5, pitch: 0.2 })
+        expect(aim.yaw).toBeCloseTo(0.5 * weaponConfig.headAimGain, 6)
+        expect(aim.pitch).toBeCloseTo(0.2 * weaponConfig.headAimGain, 6)
+        // A wild pose is clamped, never allowed to swing the shot far off the heading.
+        const extreme = headAimOffset({ yaw: 4, pitch: -4 })
+        expect(extreme.yaw).toBe(weaponConfig.headAimYawLimit)
+        expect(extreme.pitch).toBe(-weaponConfig.headAimPitchLimit)
+    })
+
+    it('leaves the shot on the flight heading when tracking is lost', () => {
+        const lossy = headAimOffset(null)
+        expect(lossy).toEqual({ yaw: 0, pitch: 0 })
+        expect(writeAimFromYaw(0.3, { x: 0, y: 0, z: 0 }, lossy.yaw, lossy.pitch))
+            .toEqual(writeAimFromYaw(0.3, { x: 0, y: 0, z: 0 }))
     })
 })

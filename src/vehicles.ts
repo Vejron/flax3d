@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { createGun, type Gun } from './weapon'
+import { gunPitch } from './weapon'
 
 /**
  * Mesh factories for every vehicle the game can spawn. Kept free of world, network and simulation
@@ -27,11 +27,12 @@ export interface FlyerRig {
      * add another part before them.
      */
     wings: WingRig[]
-    gun: Gun
+    /** Beak-tip marker; rounds and cosmetic peer shots leave from here. */
+    muzzle: THREE.Object3D
     dispose: () => void
 }
 
-/** Builds the bird: body, head, two wings and the back-mounted gun. */
+/** Builds the bird: body, head, two wings and a beak-tip muzzle its shots leave from. */
 export function buildFlyer(): FlyerRig {
     const flyer = new THREE.Group()
     const bodyMaterial = new THREE.MeshStandardMaterial({ color: '#f7eee1', roughness: 0.62, side: THREE.DoubleSide })
@@ -41,7 +42,11 @@ export function buildFlyer(): FlyerRig {
     body.rotation.x = -Math.PI / 2
     flyer.add(body)
     const head = new THREE.Group()
+    head.name = 'head'
     head.position.set(0, 0.25, -0.65)
+    // Yaw-then-pitch order, matching how the aim composes heading and head lift, so the beak points
+    // where the shot goes. The cosmetic roll is applied last and cannot reorder the muzzle's aim.
+    head.rotation.order = 'YXZ'
     const skull = new THREE.Mesh(new THREE.SphereGeometry(0.38, 12, 8), bodyMaterial)
     skull.position.set(0, 0.22, -0.2)
     head.add(skull)
@@ -56,6 +61,14 @@ export function buildFlyer(): FlyerRig {
         eye.position.set(side * 0.31, 0.29, -0.34)
         head.add(eye)
     }
+    // The muzzle rides the head, so head aim slews the spawn point too. The gun mount's up-tilt is
+    // baked into the marker (not the visible beak) so a peer's cosmetic tracer leaves the beak on
+    // the same line the local shot does.
+    const muzzle = new THREE.Object3D()
+    muzzle.name = 'muzzle'
+    muzzle.position.set(0, 0.14, -0.98)
+    muzzle.rotation.x = gunPitch
+    head.add(muzzle)
     flyer.add(head)
     const wings: WingRig[] = []
     for (const side of [-1, 1]) {
@@ -99,16 +112,12 @@ export function buildFlyer(): FlyerRig {
         wings.push({ shoulder, elbow, side })
         flyer.add(shoulder)
     }
-    // The gun is added last so the wing shoulder groups keep their child indices.
-    const gun = createGun(flyer)
-
     return {
         group: flyer,
         head,
         wings,
-        gun,
+        muzzle,
         dispose() {
-            gun.dispose()
             flyer.traverse((object) => {
                 if (object instanceof THREE.Mesh) object.geometry.dispose()
             })
