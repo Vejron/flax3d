@@ -122,7 +122,7 @@ export function buildFlyer(): FlyerRig {
                 if (object instanceof THREE.Mesh) object.geometry.dispose()
             })
             flyer.removeFromParent()
-            ;[bodyMaterial, wingMaterial, featherMaterial, beakMaterial, eyeMaterial].forEach((material) => material.dispose())
+                ;[bodyMaterial, wingMaterial, featherMaterial, beakMaterial, eyeMaterial].forEach((material) => material.dispose())
         },
     }
 }
@@ -188,7 +188,7 @@ export function buildTank(): TankRig {
                 if (object instanceof THREE.Mesh) object.geometry.dispose()
             })
             group.removeFromParent()
-            ;[armor, turretArmor, track, metal, trim].forEach((material) => material.dispose())
+                ;[armor, turretArmor, track, metal, trim].forEach((material) => material.dispose())
         },
     }
 }
